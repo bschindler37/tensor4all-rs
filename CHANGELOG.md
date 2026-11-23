@@ -13,6 +13,51 @@
   and rank-goal numerical decisions are unchanged. The greedy reconstructor's
   `ReconstructionOptions::target_bond_dim` is unchanged.
 
+- `tensor4all-hdf5` no longer sets `HDF5_USE_FILE_LOCKING=FALSE` on first use (#1386).
+  The library never touches the process environment now. If you save and then re-open
+  the same path in one process (or do so from several threads), set
+  `HDF5_USE_FILE_LOCKING=FALSE` yourself before the first HDF5 call in the process
+  (shell, service unit, Cargo `[env]`, or `main` before threads start); otherwise the
+  reopen can fail with `errno = 35`. Leaving it unset keeps HDF5's cross-process write
+  protection.
+- The tenferro pin moves to tenferro-rs `5df83672` (tenferro 0.13.0 on threadteam 0.6.1,
+  colmat 0.34, cpueinsum 0.13.0, tlinalg 0.12.0, tcontract 0.13.0; #1428). tenferro now
+  has one faer-backed CPU backend (tenferro-rs#2609), so the CPU backend features
+  `tenferro-cpu-platform`, `tenferro-cpu-faer`, `tenferro-system-blas` and
+  `tenferro-provider-inject` are removed from every crate, together with the
+  `tensor4all-cpu-platform` crate; there is no alias. macOS no longer uses Apple
+  Accelerate. Drop these features from dependency lines (and the
+  `default-features = false` that only served them). The direct dense dependency is
+  `colmat` 0.34 (the renamed `t4a-faer`). `tensor4all_tensorbackend::explicit::detach`
+  takes `&mut dyn tenferro::ExecutionEngine` instead of `&mut dyn Engine`, because
+  tenferro materializes an eager value through an eager session.
+- `tensor4all-core` no longer pins `tensor4all-tensorbackend/global-defaults` and no
+  longer enables the process-global route by default (#1403). It has its own opt-in
+  `global-defaults` feature (`backend-tenferro` is an alias); its default is the
+  platform CPU provider only, and the provider features of the workspace crates no
+  longer imply it. Without it, a context-free operation that would have adopted an
+  owner-less value into the process-global eager runtime, or run on the process-global
+  engine, returns the new `ExecutionContextEntryError::NoContext` (inside
+  `IdxTensorError::EngineEntry` or the operation's own error) instead of choosing an
+  engine; values created through a caller-owned context keep running on that context's
+  engine. With `global-defaults` nothing changes. `tensor4all-treersi` drops
+  `global-defaults` from its defaults (so `hadamard_many` needs it; `hadamard_many_in`
+  does not); `tenferro-cuda` (in core, and so in every crate forwarding it) still implies it, because
+  CUDA execution keeps host steps with no caller CPU context (core's CUDA-resident SRC
+  readback, treersi's rank decision). `tensor4all-hdf5` enables it in its
+  library, because its load API takes no context. Callers of the context-free API enable
+  `tensor4all-core/global-defaults`. Explicit callers of
+  `IdxTensor::src_error_estimate_in` and of structured contractions with host-only
+  operands now run the estimator solve and the native einsum on their own context's
+  engine instead of the process-global one. New: `src_error_estimate_general_in`.
+  `TensorTrain::norm`/`norm_squared` run the packed-site backend kernel on the CPU
+  context that owns the chain (new `IdxTensor::with_owning_cpu_engine`) in every build;
+  only a chain with no CPU-owned value uses the process-global context (or refuses
+  without `global-defaults`). `IdxTensor::scale` places an untracked `AnyScalar` that has
+  no tensor of its own in the operand's runtime, so scaling context-owned values works
+  without `global-defaults`. In every build, `From<anyhow::Error> for IdxTensorError`
+  recovers a wrapped `ExecutionContextEntryError` as `IdxTensorError::EngineEntry`
+  instead of `IdxTensorError::Operation`.
 - `tensor4all-tensorbackend`: `global-defaults` is no longer enabled by the default
   features (#1377). The default is now `explicit-context` plus the platform CPU
   provider, which also exposes `Matrix`, `Storage`, `TensorElement`, the native
@@ -110,9 +155,52 @@
   variable, puts every pair of `contract_adaptive` into one group whose summed
   bond is the sum of all contribution bonds; it previously ran out of memory.
   Such an operator is applied with `schedule_merge_refine` instead.
+- `tensor4all-core`: `direct_sum`, `direct_sum_many` and, through
+  `TensorContractionLike`, `TreeTN::add` / `add_many` promote operands of
+  different dense scalar types instead of refusing them. The lattice is the one
+  the eager arithmetic already uses: `f32 + f64 -> f64`, `f32 + Complex32 ->
+  Complex32`, `f64 + Complex64 -> Complex64` and `f64 + Complex32 -> Complex64`
+  (so a real network and a complex-scaled copy of it add). Operands are cast
+  before the block copy, so each block stays exact; a same-type call allocates
+  nothing new. Tracked operands are still rejected (#1426).
+- `tensor4all-treetci`: `DefaultProposer` (and through it
+  `TruncatedDefaultProposer`) expands a vertex of local dimension 1 whose
+  candidates are locked (#1352). Such a vertex has no index to expand, so its
+  side of an edge offered only the product of its other bonds' pivots, and
+  two bonds through it could cap each other below the true rank. A frozen
+  three-branch table then stopped `Converged` at tolerance 1e-10 with a dense
+  error of 6.3e-10 (seed 4) and 2.5e-8 (seed 6). When that product is below
+  twice the edge's current rank, the largest-rank other bond is now replaced
+  by its neighbour's own candidates, expanded over the neighbour's local
+  index. Above that threshold nothing changes. On the #1153 comb the
+  oracle-point cost at matched accuracy is 0.88–1.07x the previous one, and
+  the reopened table needs about 25% fewer points. Trajectories on trees with
+  such a vertex change, including the pinned #1153 junction ranks.
 
 ### Added
 
+- `tensor4all_tensorbackend::explicit::Session::batched_mat_mul_same_shape_owned`: the session
+  twin of the process-global batched same-shape GEMM, one einsum on the session's engine
+  (#1382).
+
+- `tensor4all-tensorbackend` adds `Runtime`, an engine-free runtime that several
+  engines share (#1393, stage A2 of #1376). It holds the eager AD runtime, the graph
+  compiler and the compiled-program cache, and no engine or engine lock; clones are
+  the same runtime. `Runtime::with_eager(exec, f)` and
+  `Runtime::run_graph(graph, inputs, exec)` borrow the caller's
+  `exec: &mut dyn ExecutionEngine` for one call, so a value made on one `CpuEngine`
+  runs on any other `CpuEngine` the runtime supports. `Runtime::check_engine` refuses
+  an engine with another runtime id, engine type or allocation domain with
+  `RuntimeError::UnsupportedEngine` instead of registering it lazily. With
+  `tenferro-cuda`, `Runtime::for_cuda_engine` builds a CUDA runtime (no graph path),
+  and `CudaEngine`/`CudaDeviceId` are re-exported. `ExecutionEngine` is re-exported.
+  `CpuExecutionContext` and `CudaExecutionContext` are now built on a private
+  `Runtime` each, with the same numerics and error messages. One difference: a CPU
+  context now builds its graph and eager runtimes together on first use. Any first
+  use (`compile_graph`, `run_graph`, `graph_cache_stats`, `eager_runtime`) can
+  therefore report an initialization failure of either half (for example
+  `eager_runtime` can report `graph CPU engine`), and the `Debug` output reports
+  `graph_initialized` and `eager_initialized` together.
 - `tensor4all-treetn` adds `TreeTN::estimate_exact_sum_bytes` (#1309), the
   size estimate of `TreeTN::exact_sum` taken before the sum is built.
 - `tensor4all-treetn` adds `LinearOperator::to_state_network` and
@@ -138,6 +226,23 @@
 
 ### Breaking Rust API changes
 
+- `tensor4all-aci`: `AciError` has a new `Backend { operation, source }` variant (#1382).
+  A matrix product of the ACI sweep that the execution context refuses (for example a
+  reentrant session), that the engine rejects, or whose operand shapes disagree is now
+  reported as `AciError::Backend` with the original error as `source`, instead of
+  `AciError::InvalidInitialGuess`, which is kept for problems with the initial guess.
+  An exhaustive `match` on `AciError` needs the new arm. `elementwise_batched_with_rng_in`
+  now runs every factorization and matrix product of the workload on the caller's
+  context, including the batched frame updates, local block setup and global-pivot
+  environments that previously took the process-global route; the context-free entries
+  run the same code path on the process-global context. In a build without
+  `global-defaults` they return `AciError::Backend` for a run that needs a sweep, after
+  input and option validation; the single-site case needs no context and still succeeds.
+
+- `tensor4all-core`: `IdxTensorError` has two new variants, `RuntimeMismatch` and
+  `PlacementMismatch` (#1393). The enum is not `#[non_exhaustive]`, so exhaustive
+  matches must add both arms. They are reported by the engine-taking operation entry
+  that stage B2 of #1376 makes public; no current public operation returns them yet.
 - `tensor4all-partitionedtreetn`: `PartitionedContractionOptions` has the new
   field `group_sum_limit_bytes` (#1316). Complete struct literals must add it.
   `contract` and `contract_selected` return `GroupSumLimit` before building a

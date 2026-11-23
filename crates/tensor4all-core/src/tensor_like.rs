@@ -19,7 +19,6 @@ use crate::truncation::{
     validate_svd_truncation_options, SvdTruncationOptionsError, SvdTruncationPolicy,
 };
 use crate::TensorElement;
-use num_complex::Complex64;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -554,13 +553,15 @@ pub struct FactorizeResult<T: TensorIndex> {
     /// with a dimension-one bond and an exactly zero product. The selected
     /// canonical factor keeps its unit diagonal; the other factor is zero.
     pub rank: usize,
+    #[cfg(feature = "global-defaults")]
     incremental_qr_state: Option<IncrementalQrState>,
 }
 
+#[cfg(feature = "global-defaults")]
 #[derive(Debug, Clone)]
 pub(crate) enum IncrementalQrState {
     F64(tensor4all_tensorbackend::IncrementalQr<f64>),
-    C64(tensor4all_tensorbackend::IncrementalQr<Complex64>),
+    C64(tensor4all_tensorbackend::IncrementalQr<num_complex::Complex64>),
 }
 
 impl<T: TensorIndex> FactorizeResult<T> {
@@ -603,15 +604,18 @@ impl<T: TensorIndex> FactorizeResult<T> {
             bond_index,
             singular_values,
             rank,
+            #[cfg(feature = "global-defaults")]
             incremental_qr_state: None,
         }
     }
 
+    #[cfg(feature = "global-defaults")]
     pub(crate) fn with_incremental_qr_state(mut self, state: IncrementalQrState) -> Self {
         self.incremental_qr_state = Some(state);
         self
     }
 
+    #[cfg(feature = "global-defaults")]
     pub(crate) fn incremental_qr_state(&self) -> Option<&IncrementalQrState> {
         self.incremental_qr_state.as_ref()
     }
@@ -1038,7 +1042,10 @@ pub trait TensorContractionLike: TensorIndex {
     ///
     /// Returns `Self::Error` when the summed index spaces are incompatible
     /// (an index-space mismatch) or the underlying construction reports a
-    /// failure.
+    /// failure. Implementations whose scalar storage supports mixed operands
+    /// promote them to their common type instead of refusing the sum;
+    /// `IdxTensor`, and so every `TreeTN` over it, promotes `f32`, `f64`,
+    /// `Complex32` and `Complex64` as the eager arithmetic does.
     fn direct_sum(
         &self,
         other: &Self,

@@ -22,7 +22,7 @@ features = ["partitioned"]
 
 [features]
 partitioned = ["dep:tensor4all-partitionedtreetn"]
-default = ["tenferro-cpu-platform", "simplett-transforms"]
+default = ["simplett-transforms"]
 simplett-transforms = [
     "dep:tensor4all-simplett",
     "dep:num-bigint",
@@ -30,32 +30,6 @@ simplett-transforms = [
     "dep:num-rational",
     "dep:num-traits",
     "dep:sprs",
-]
-# The platform default: Apple Accelerate on macOS, faer elsewhere
-# (see the `tensor4all-cpu-platform` crate).
-tenferro-cpu-platform = [
-    "tensor4all-core/tenferro-cpu-platform",
-    "tensor4all-simplett?/tenferro-cpu-platform",
-    "tensor4all-treetn/tenferro-cpu-platform",
-    "tensor4all-partitionedtreetn?/tenferro-cpu-platform",
-]
-tenferro-cpu-faer = [
-    "tensor4all-core/tenferro-cpu-faer",
-    "tensor4all-simplett?/tenferro-cpu-faer",
-    "tensor4all-treetn/tenferro-cpu-faer",
-    "tensor4all-partitionedtreetn?/tenferro-cpu-faer",
-]
-tenferro-system-blas = [
-    "tensor4all-core/tenferro-system-blas",
-    "tensor4all-simplett?/tenferro-system-blas",
-    "tensor4all-treetn/tenferro-system-blas",
-    "tensor4all-partitionedtreetn?/tenferro-system-blas",
-]
-tenferro-provider-inject = [
-    "tensor4all-core/tenferro-provider-inject",
-    "tensor4all-simplett?/tenferro-provider-inject",
-    "tensor4all-treetn/tenferro-provider-inject",
-    "tensor4all-partitionedtreetn?/tenferro-provider-inject",
 ]
 
 [dependencies]
@@ -74,6 +48,9 @@ anyhow.workspace = true
 sprs = { version = "0.11", optional = true }
 
 [dev-dependencies]
+# Tests, doctests and benches still exercise the context-free API, which needs
+# the process-global route (tensor4all-rs#1403); the library itself does not.
+tensor4all-core = { path = "../tensor4all-core", default-features = false, features = ["global-defaults"] }
 tensor4all-interpolativeqtt = { path = "../tensor4all-interpolativeqtt", default-features = false }
 # `tests/integration_test.rs` converts SimpleTT states with the TreeTN bridge.
 tensor4all-treetn = { path = "../tensor4all-treetn", default-features = false, features = ["simplett-bridge"] }
@@ -118,7 +95,7 @@ required-features = ["simplett-transforms"]
 name = "qft_reconstruction"
 path = "tests/qft_reconstruction.rs"
 
-# Heavy tests (`#[ignore]`, selected by `test(/^heavy_/)` in heavy-tests.yml).
+# Heavy tests (`#[ignore]`, selected by `test(/(^|::)heavy_/)` in heavy-tests.yml).
 [[test]]
 name = "heavy"
 path = "tests/main.rs"

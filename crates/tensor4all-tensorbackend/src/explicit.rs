@@ -47,16 +47,17 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use tenferro::CoreOps;
 use tenferro::Tensor as NativeTensor;
-use tenferro::TensorSessionOpsExt;
-use tenferro_einsum::{ConcreteEinsumPlan, EinsumSubscripts, TensorEinsumExt};
-use tenferro_linalg::TensorLinalgExt;
+use tenferro_einsum::{ConcreteEinsumPlan, EinsumOps, EinsumOptions, EinsumSubscripts};
+use tenferro_linalg::{FullPivLu, LinalgOps, Qr, Svd};
 
 use tenferro_tensor::{DotGeneralConfig, Engine, TensorRead};
 
 use crate::context::{CpuExecutionContext, CpuExecutionContextError};
 use crate::einsum_ids::{
     build_binary_einsum_ids, checked_native_einsum_labels, common_dtype, convert_native_tensor_in,
+    signed_axes,
 };
 
 /// One explicit concrete session over a caller-held CPU engine.
@@ -156,10 +157,11 @@ pub enum ConversionError {
 /// ```
 pub fn detach(
     eager: &tenferro_ad::EagerTensor,
-    engine: &mut dyn Engine,
+    engine: &mut dyn tenferro::ExecutionEngine,
 ) -> Result<NativeTensor, ConversionError> {
     eager
-        .to_tensor(engine)
+        .runtime()
+        .with_eager_session(engine, |session| session.duplicate_value(eager))
         .map_err(|source| ConversionError::Detach {
             source: Box::new(source),
         })
@@ -201,11 +203,11 @@ pub fn lift(
         .map_err(|source| ConversionError::Lift {
             source: Box::new(source),
         })?;
-    tenferro_ad::EagerTensor::from_tensor_in(tensor, runtime).map_err(|source| {
-        ConversionError::Lift {
+    runtime
+        .constant_from(tensor)
+        .map_err(|source| ConversionError::Lift {
             source: Box::new(source),
-        }
-    })
+        })
 }
 
 /// One prepared N-ary einsum, reusable across operations of a session.
@@ -288,7 +290,7 @@ impl<'operands> PreparedEinsum<'operands> {
             .map_err(invalid)?;
         let output = checked_native_einsum_labels(output_ids).map_err(invalid)?;
         let subscripts = EinsumSubscripts { inputs, output };
-        let plan = ConcreteEinsumPlan::prepare_read_subscripts(operands, &subscripts)?;
+        let plan = ConcreteEinsumPlan::prepare(operands, &subscripts, &EinsumOptions::default())?;
         Ok(Self {
             plan,
             operands: operands.to_vec(),
@@ -299,13 +301,13 @@ impl<'operands> PreparedEinsum<'operands> {
     ///
     /// # Errors
     ///
-    /// Returns [`tenferro_einsum::Error::Tensor`] when the session rejects the operands
-    /// or the contraction itself fails, and
-    /// [`tenferro_einsum::Error::Validation`] when the operands no longer match the
-    /// planned expression.
+    /// Returns [`tenferro_einsum::Error::Tensor`] when the session rejects the operands,
+    /// when the contraction itself fails, or (wrapping a tenferro `Validation` error)
+    /// when the operands no longer match the planned expression.
     pub fn execute(&self, session: &mut Session<'_>) -> tenferro_einsum::Result<NativeTensor> {
-        self.plan
-            .execute_read(self.operands.as_slice(), session.engine())
+        Ok(self
+            .plan
+            .execute(self.operands.as_slice(), session.engine())?)
     }
 
     /// Evaluate the prepared plan into a caller-provided destination.
@@ -317,16 +319,18 @@ impl<'operands> PreparedEinsum<'operands> {
     /// # Errors
     ///
     /// Returns [`tenferro_einsum::Error::Tensor`] when the session rejects the operands,
-    /// the destination or the contraction, and
-    /// [`tenferro_einsum::Error::Validation`] when the operands no longer match the
-    /// planned expression.
+    /// the destination or the contraction, or (wrapping a tenferro `Validation` error)
+    /// when the operands no longer match the planned expression.
     pub fn execute_into(
         &self,
         session: &mut Session<'_>,
         out: tenferro_tensor::TensorWrite<'_>,
     ) -> tenferro_einsum::Result<()> {
-        self.plan
-            .execute_read_into(self.operands.as_slice(), session.engine(), out)
+        Ok(self.plan.execute_into(
+            self.operands.as_slice(),
+            session.engine(),
+            tenferro_tensor::Dest::overwrite(out),
+        )?)
     }
 }
 
@@ -453,7 +457,8 @@ impl<'session> Session<'session> {
         tensor: &NativeTensor,
         perm: &[usize],
     ) -> tenferro_tensor::Result<NativeTensor> {
-        tensor.transpose(perm, self.engine)
+        let perm = signed_axes("permute", perm)?;
+        tensor.transpose(&perm, self.engine)
     }
 
     /// Binary contraction along the given axes, preserving the remaining axes in
@@ -525,7 +530,7 @@ impl<'session> Session<'session> {
         } else {
             promoted.iter().collect::<Vec<_>>()
         };
-        operands.einsum_subscripts(&subscripts, self.engine)
+        Ok(operands.einsum(&subscripts, self.engine)?)
     }
 
     /// Binary contraction of two borrowed reads that share a dtype, as one `dot_general`.
@@ -659,7 +664,7 @@ impl<'session> Session<'session> {
         } else {
             promoted.iter().collect()
         };
-        operands.einsum_subscripts(&subscripts, self.engine)
+        Ok(operands.einsum(&subscripts, self.engine)?)
     }
 
     /// Sum every element of a concrete tensor, returning the rank-0 result.
@@ -692,8 +697,7 @@ impl<'session> Session<'session> {
         if tensor.shape().is_empty() {
             return tensor.duplicate();
         }
-        let axes = (0..tensor.shape().len()).collect::<Vec<_>>();
-        tensor.reduce_sum(Some(&axes), self.engine)
+        tensor.reduce_sum(None, self.engine)
     }
 
     /// Conjugate a concrete tensor.
@@ -786,8 +790,8 @@ impl<'session> Session<'session> {
             .map_err(invalid)?;
         let output = checked_native_einsum_labels(output_ids).map_err(invalid)?;
         let subscripts = EinsumSubscripts { inputs, output };
-        let plan = ConcreteEinsumPlan::prepare_read_subscripts(operands, &subscripts)?;
-        plan.execute_read(operands, self.engine)
+        let plan = ConcreteEinsumPlan::prepare(operands, &subscripts, &EinsumOptions::default())?;
+        Ok(plan.execute(operands, self.engine)?)
     }
 
     /// Binary contraction into a caller-provided destination.
@@ -841,8 +845,13 @@ impl<'session> Session<'session> {
             tenferro_tensor::TensorRead::from_tensor(lhs),
             tenferro_tensor::TensorRead::from_tensor(rhs),
         ];
-        let plan = ConcreteEinsumPlan::prepare_read_subscripts(&inputs[..], &subscripts)?;
-        plan.execute_read_into(&inputs[..], self.engine, out)
+        let plan =
+            ConcreteEinsumPlan::prepare(&inputs[..], &subscripts, &EinsumOptions::default())?;
+        Ok(plan.execute_into(
+            &inputs[..],
+            self.engine,
+            tenferro_tensor::Dest::overwrite(out),
+        )?)
     }
 
     /// Solve `A X = B` for column-major matrices on this session.
@@ -1104,6 +1113,78 @@ impl<'session> Session<'session> {
         crate::mat_mul_in(self.engine, a, b)
     }
 
+    /// Batched matrix multiplication of `batch` same-shape column-major pairs on this session's engine.
+    ///
+    /// Computes `C[p] = A[p] * B[p]` for `p in 0..batch`, where `a` holds `batch` consecutive `m x k`
+    /// column-major matrices and `b` holds `batch` consecutive `k x n` ones. The result holds `batch`
+    /// consecutive `m x n` column-major outputs. This is the session twin of the process-global
+    /// `batched_mat_mul_same_shape_owned`: one einsum on this session's engine, with no global fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatrixMulError`](crate::matrix::MatrixMulError) when a buffer length disagrees with the declared
+    /// shape, a shape product overflows, or the engine rejects the product.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tensor4all_tensorbackend::{CpuBackend, CpuExecutionContext};
+    ///
+    /// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+    /// // Two 2x2 products: [[1,2],[3,4]] * I and [[1,0],[0,1]] * [[5,6],[7,8]].
+    /// let a = vec![1.0_f64, 3.0, 2.0, 4.0, 1.0, 0.0, 0.0, 1.0];
+    /// let b = vec![1.0_f64, 0.0, 0.0, 1.0, 5.0, 7.0, 6.0, 8.0];
+    /// let c = context.with_concrete_session(|session| {
+    ///     session.batched_mat_mul_same_shape_owned(2, 2, 2, 2, a, b)
+    /// })??;
+    /// assert_eq!(c, vec![1.0, 3.0, 2.0, 4.0, 5.0, 7.0, 6.0, 8.0]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn batched_mat_mul_same_shape_owned<T: tenferro::TensorScalar + Copy>(
+        &mut self,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: Vec<T>,
+        b: Vec<T>,
+    ) -> Result<Vec<T>, crate::matrix::MatrixMulError> {
+        use crate::matrix::MatrixMulError;
+
+        crate::matrix::validate_batched_mat_mul_inputs(batch, m, k, n, a.len(), b.len())?;
+        let expected_len = batch
+            .checked_mul(m)
+            .and_then(|value| value.checked_mul(n))
+            .ok_or_else(|| {
+                MatrixMulError::from(anyhow::anyhow!(
+                    "batched matrix multiplication output shape overflows"
+                ))
+            })?;
+        let a = T::into_tensor(vec![m, k, batch], a)
+            .map_err(|error| MatrixMulError::from(anyhow::Error::new(error)))?;
+        let b = T::into_tensor(vec![k, n, batch], b)
+            .map_err(|error| MatrixMulError::from(anyhow::Error::new(error)))?;
+        // [m,k,p] x [k,n,p] -> [m,n,p] as one einsum, the same expression as the global route.
+        let c = self
+            .einsum(&[&a, &b], &[&[0, 1, 2], &[1, 3, 2]], &[0, 3, 2])
+            .map_err(|error| MatrixMulError::from(anyhow::Error::new(error)))?;
+        let c = T::into_typed(c).map_err(|error| {
+            MatrixMulError::from(anyhow::anyhow!(
+                "batched matrix multiplication returned wrong dtype: {error}"
+            ))
+        })?;
+        let (_shape, data) = c
+            .into_vec_col_major()
+            .map_err(|error| MatrixMulError::from(anyhow::Error::new(error)))?;
+        if data.len() != expected_len {
+            return Err(MatrixMulError::from(anyhow::anyhow!(
+                "batched matrix multiplication returned {} values for expected shape {m}x{n}x{batch}",
+                data.len()
+            )));
+        }
+        Ok(data)
+    }
+
     /// Thin/economy QR decomposition.
     ///
     /// # Errors
@@ -1135,7 +1216,8 @@ impl<'session> Session<'session> {
         &mut self,
         tensor: &NativeTensor,
     ) -> tenferro_tensor::Result<(NativeTensor, NativeTensor)> {
-        tensor.qr(self.engine)
+        let Qr { q, r } = tensor.qr(self.engine)?;
+        Ok((q, r))
     }
 
     /// Thin/economy SVD.
@@ -1166,7 +1248,8 @@ impl<'session> Session<'session> {
         &mut self,
         tensor: &NativeTensor,
     ) -> tenferro_tensor::Result<(NativeTensor, NativeTensor, NativeTensor)> {
-        tensor.svd(self.engine)
+        let Svd { u, s, vh } = tensor.svd(self.engine)?;
+        Ok((u, s, vh))
     }
 
     /// Solve `A X = B` for a square `A`.
@@ -1239,12 +1322,9 @@ impl<'session> Session<'session> {
         transpose_a: bool,
         unit_diagonal: bool,
     ) -> tenferro_tensor::Result<NativeTensor> {
-        lhs.triangular_solve(
+        lhs.triangular_solve_with(
             rhs,
-            left_side,
-            lower,
-            transpose_a,
-            unit_diagonal,
+            &crate::backend::triangular_solve_options(left_side, lower, transpose_a, unit_diagonal),
             self.engine,
         )
     }
@@ -1290,7 +1370,8 @@ impl<'session> Session<'session> {
         NativeTensor,
         NativeTensor,
     )> {
-        tensor.full_piv_lu(self.engine)
+        let FullPivLu { p, l, u, q, parity } = tensor.full_piv_lu(self.engine)?;
+        Ok((p, l, u, q, parity))
     }
 }
 

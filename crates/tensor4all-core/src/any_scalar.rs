@@ -13,9 +13,7 @@ use tensor4all_tensorbackend::{
     BackendScalar, ScalarTensorElement, ScalarValue, Storage, SumFromStorage,
 };
 
-use crate::defaults::eager_session::{
-    with_eager_session_typed, with_engine, with_execution_engine,
-};
+use crate::defaults::eager_session::{with_eager_session, with_eager_session_typed};
 use crate::defaults::idx_tensor::IdxTensor;
 
 #[cfg(test)]
@@ -310,6 +308,25 @@ impl AnyScalar {
             tensor: Ok(tensor),
             value: T::scalar_value(value),
             tracks_grad: false,
+        }
+    }
+
+    /// The scalar's value as a host rank-0 native tensor.
+    ///
+    /// For a caller that places an untracked scalar in its operand's eager
+    /// runtime itself: in a build without `global-defaults` an untracked
+    /// `AnyScalar` has no eager tensor of its own (there is no process-global
+    /// runtime to create it in), but its value is always available.
+    #[cfg(not(feature = "global-defaults"))]
+    pub(crate) fn host_native(&self) -> Result<tenferro::Tensor> {
+        use tensor4all_tensorbackend::dense_native_tensor_from_col_major as host;
+        match self.value {
+            ScalarValue::F32(value) => host(&[value], &[]),
+            ScalarValue::F64(value) => host(&[value], &[]),
+            ScalarValue::C32(value) => host(&[value], &[]),
+            ScalarValue::C64(value) => host(&[value], &[]),
+            // Unreachable: see the invariant on `AnyScalar::value`.
+            other => Err(anyhow!("unsupported AnyScalar value {other:?}")),
         }
     }
 
@@ -621,7 +638,7 @@ impl AnyScalar {
     /// ```
     pub fn backward(&self) -> std::result::Result<(), AnyScalarError> {
         let inner = self.as_tensor()?.as_inner()?;
-        with_execution_engine(inner.runtime(), None, |engine| inner.backward(engine))
+        with_eager_session(inner.runtime(), None, |session| session.backward(inner))
             .map(|_| ())
             .map_err(|error| AnyScalarError::from(anyhow::Error::new(error)))
     }
@@ -653,7 +670,7 @@ impl AnyScalar {
     pub fn detach(&self) -> std::result::Result<Self, AnyScalarError> {
         let tensor = self.as_tensor()?;
         let inner = tensor.as_inner()?;
-        let detached = with_engine(inner.runtime(), None, |engine| inner.detach(engine))
+        let detached = with_eager_session(inner.runtime(), None, |session| session.detach(inner))
             .map_err(|error| AnyScalarError::from(anyhow::Error::new(error)))?;
         Self::from_tensor(IdxTensor::from_inner(vec![], detached)?).map_err(AnyScalarError::from)
     }

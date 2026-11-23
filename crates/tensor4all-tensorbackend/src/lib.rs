@@ -18,7 +18,7 @@ mod any_scalar;
 #[cfg(feature = "explicit-context")]
 /// Backend dispatch for dense linear algebra operations.
 mod backend;
-#[cfg(feature = "global-defaults")]
+#[cfg(feature = "explicit-context")]
 /// Complete-pivoting LU of a square matrix stopped at a rank cap.
 mod capped_full_piv_lu;
 #[cfg(feature = "explicit-context")]
@@ -46,6 +46,9 @@ mod matrix;
 /// Process-level memory pressure helpers.
 mod memory;
 #[cfg(feature = "explicit-context")]
+/// The engine-free shared runtime (`Runtime`) and its `&mut`-engine entries.
+mod runtime;
+#[cfg(feature = "explicit-context")]
 /// Tensor snapshot storage types and low-level dense/diagonal kernels.
 mod storage;
 #[cfg(feature = "explicit-context")]
@@ -64,23 +67,23 @@ pub use backend::{
 };
 #[cfg(feature = "explicit-context")]
 pub use backend::{
-    full_piv_lu_matrix_in, qr_backend_in, solve_matrix_in, svd_backend_in,
-    triangular_solve_matrix_in, BackendLinalgError, BackendLinalgScalar, FullPivLuMatrixResult,
-    FullPivLuResult, FullPivLuScalar, MatrixSolveScalar, MatrixTriangularSolveScalar,
-    SrcErrorEstimate, SvdResult,
+    full_piv_lu_matrix_in, qr_backend_in, solve_matrix_in, src_error_estimate_general_in,
+    svd_backend_in, triangular_solve_matrix_in, BackendLinalgError, BackendLinalgScalar,
+    FullPivLuMatrixResult, FullPivLuResult, FullPivLuScalar, MatrixSolveScalar,
+    MatrixTriangularSolveScalar, SrcErrorEstimate, SvdResult,
 };
-#[cfg(feature = "global-defaults")]
+#[cfg(feature = "explicit-context")]
 pub use capped_full_piv_lu::{capped_full_piv_lu, CappedFullPivLu, CappedFullPivLuScalar};
 #[cfg(feature = "global-defaults")]
 pub use context::{
-    default_cpu_execution_context, default_eager_ctx, with_default_backend, with_runtime_engine,
-    EagerContextError, ExecutionContextEntryError,
+    default_cpu_execution_context, default_eager_ctx, with_default_backend, EagerContextError,
 };
 #[cfg(feature = "explicit-context")]
 pub use context::{
     default_cpu_wait_policy, set_default_cpu_threads, set_default_cpu_wait_policy,
-    AlreadyInitialized, CpuBackend, CpuExecutionContext, CpuExecutionContextError, CpuThreadError,
-    CpuWaitPolicy, ExecutionContext, WaitPolicyAlreadyInitialized,
+    with_runtime_engine, AlreadyInitialized, CpuBackend, CpuExecutionContext,
+    CpuExecutionContextError, CpuThreadError, CpuWaitPolicy, ExecutionContext,
+    ExecutionContextEntryError, WaitPolicyAlreadyInitialized,
 };
 #[cfg(feature = "tenferro-cuda")]
 pub use cuda::{
@@ -106,6 +109,8 @@ pub use matrix::{
 };
 #[cfg(feature = "explicit-context")]
 pub use memory::{release_process_allocator_cached_memory, AllocatorPressureRelief};
+#[cfg(feature = "explicit-context")]
+pub use runtime::{Runtime, RuntimeError};
 #[cfg(feature = "global-defaults")]
 pub use storage::contract_storage;
 #[cfg(feature = "explicit-context")]
@@ -113,6 +118,9 @@ pub use storage::{
     make_mut_storage, min_dim, scale_target_dtype, NonfiniteFlags, Storage, StorageError,
     StorageKind, StorageResult, StorageScalar, StructuredStorage, SumFromStorage,
 };
+/// The engine trait every computing entry takes as `exec: &mut dyn ExecutionEngine`.
+#[cfg(feature = "explicit-context")]
+pub use tenferro::ExecutionEngine;
 #[cfg(feature = "global-defaults")]
 pub use tenferro_bridge::{
     axpby_native_tensor, axpby_storage_native, contract_native_tensor, contract_storage_native,
@@ -133,6 +141,9 @@ pub use tenferro_bridge::{
     storage_payload_native_read_input, storage_to_native_tensor, tangent_native_tensor,
     BridgeError, NativeEinsumPlan, NativeTensorReadInput,
 };
+/// The CUDA engine a caller opens and passes as `exec`, and its device id.
+#[cfg(feature = "tenferro-cuda")]
+pub use tenferro_gpu::cuda::{CudaDeviceId, CudaEngine};
 #[cfg(feature = "explicit-context")]
 pub use tensor_element::TensorElement;
 

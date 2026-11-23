@@ -4,11 +4,9 @@
 //! routing the actual work through the shared tenferro CPU backend.
 
 use anyhow::{anyhow, Result};
-#[cfg(feature = "global-defaults")]
-use num_complex::ComplexFloat;
-use num_complex::{Complex32, Complex64};
-use tenferro::{DType, Tensor, TensorScalar, TensorSessionOpsExt, TypedTensor};
-use tenferro_linalg::TensorLinalgExt;
+use num_complex::{Complex32, Complex64, ComplexFloat};
+use tenferro::{CoreOps, DType, Tensor, TensorScalar, TypedTensor};
+use tenferro_linalg::{FullPivLu, LinalgOps, Qr, Svd};
 
 #[cfg(feature = "global-defaults")]
 use crate::context::with_default_session;
@@ -673,6 +671,53 @@ pub fn src_error_estimate_general<T>(
 where
     T: MatrixSolveScalar + ComplexFloat,
 {
+    src_error_estimate_general_with(factor, |a, b| solve_matrix(a, b))
+}
+
+/// [`src_error_estimate_general`] on an engine the caller already holds.
+///
+/// The estimator is the same; only the small general solve `R† G = I` runs on
+/// `session` instead of the process-global context.
+///
+/// # Errors
+///
+/// Returns [`BackendLinalgError`] when `factor` is empty, non-square, singular,
+/// contains non-finite values, or when the solve on `session` fails.
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_tensorbackend::{
+///     src_error_estimate_general_in, CpuBackend, CpuExecutionContext, Matrix,
+/// };
+///
+/// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+/// let factor = Matrix::from_col_major_vec(2, 2, vec![0.0_f64, 3.0, 2.0, 1.0]);
+/// let estimate = context.with_session(|engine| src_error_estimate_general_in(engine, &factor))??;
+/// assert!(estimate.error.is_finite());
+/// assert!((estimate.norm - (14.0_f64 / 2.0).sqrt()).abs() < 1.0e-12);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn src_error_estimate_general_in<T>(
+    session: &mut dyn tenferro_tensor::Engine,
+    factor: &Matrix<T>,
+) -> std::result::Result<SrcErrorEstimate, BackendLinalgError>
+where
+    T: MatrixSolveScalar + ComplexFloat,
+{
+    src_error_estimate_general_with(factor, |a, b| {
+        T::solve_matrix_in_impl(session, a, b).map_err(BackendLinalgError::from)
+    })
+}
+
+/// Shared body of the general SRC estimator; `solve` performs `R† G = I`.
+fn src_error_estimate_general_with<T>(
+    factor: &Matrix<T>,
+    solve: impl FnOnce(&Matrix<T>, &Matrix<T>) -> std::result::Result<Matrix<T>, BackendLinalgError>,
+) -> std::result::Result<SrcErrorEstimate, BackendLinalgError>
+where
+    T: MatrixSolveScalar + ComplexFloat,
+{
     let nrows = factor.nrows();
     let ncols = factor.ncols();
     if nrows != ncols {
@@ -702,7 +747,7 @@ where
         }
         identity[[col, col]] = T::one();
     }
-    let inverse_adjoint = solve_matrix(&adjoint, &identity).map_err(|error| {
+    let inverse_adjoint = solve(&adjoint, &identity).map_err(|error| {
         BackendLinalgError::from(anyhow!("SRC inverse-adjoint general solve failed: {error}"))
     })?;
     src_error_estimate_from_inverse_adjoint(factor, &inverse_adjoint)
@@ -781,7 +826,6 @@ where
 /// The inverse-adjoint argument is intentionally separate from
 /// [`src_error_estimate`] so incremental QR can reuse its updated triangular
 /// solve state. This helper performs only norm accumulation and validation.
-#[cfg(feature = "global-defaults")]
 pub(crate) fn src_error_estimate_from_inverse_adjoint<T>(
     r: &Matrix<T>,
     inverse_adjoint: &Matrix<T>,
@@ -879,8 +923,6 @@ where
     T: BackendLinalgScalar + Copy,
     Tensor: From<TypedTensor<T>>,
 {
-    use tenferro_linalg::TensorLinalgExt;
-
     let a_tensor: Tensor = a.into_typed_tensor().into();
     let b_tensor: Tensor = b.into_typed_tensor().into();
     let result = a_tensor
@@ -994,6 +1036,30 @@ where
     .map_err(|e| anyhow!("triangular solve failed via tenferro-tensor: {e}"))?
 }
 
+/// The tenferro options for this crate's `(left_side, lower, transpose_a, unit_diagonal)`
+/// flags. `transpose_a` is a plain transpose, never an adjoint.
+pub(crate) fn triangular_solve_options(
+    left_side: bool,
+    lower: bool,
+    transpose_a: bool,
+    unit_diagonal: bool,
+) -> tenferro_linalg::TriangularSolveOptions {
+    use tenferro_linalg::{Diag, MatOp, Side, TriangularSolveOptions, Uplo};
+    TriangularSolveOptions::default()
+        .side(if left_side { Side::Left } else { Side::Right })
+        .uplo(if lower { Uplo::Lower } else { Uplo::Upper })
+        .op(if transpose_a {
+            MatOp::Transpose
+        } else {
+            MatOp::None
+        })
+        .diag(if unit_diagonal {
+            Diag::Unit
+        } else {
+            Diag::NonUnit
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn triangular_solve_matrix_direct_owned_in<T>(
     session: &mut dyn tenferro_tensor::Engine,
@@ -1008,17 +1074,12 @@ where
     T: BackendLinalgScalar + Copy,
     Tensor: From<TypedTensor<T>>,
 {
-    use tenferro_linalg::TensorLinalgExt;
-
     let a_tensor: Tensor = a.into_typed_tensor().into();
     let b_tensor: Tensor = b.into_typed_tensor().into();
     let result = a_tensor
-        .triangular_solve(
+        .triangular_solve_with(
             &b_tensor,
-            left_side,
-            lower,
-            transpose_a,
-            unit_diagonal,
+            &triangular_solve_options(left_side, lower, transpose_a, unit_diagonal),
             session,
         )
         .map_err(|e| anyhow!("triangular solve failed via tenferro-tensor: {e}"))?;
@@ -1587,9 +1648,7 @@ pub fn svd_backend_in<T>(
 where
     T: BackendLinalgScalar,
 {
-    use tenferro_linalg::TensorLinalgExt;
-
-    let (u, s, vt) = tensor
+    let Svd { u, s, vh: vt } = tensor
         .svd(session)
         .map_err(|e| anyhow!("SVD computation failed via tenferro-tensor: {e}"))?;
     Ok(SvdResult {
@@ -1634,9 +1693,7 @@ pub fn qr_backend_in<T>(
 where
     T: BackendLinalgScalar,
 {
-    use tenferro_linalg::TensorLinalgExt;
-
-    let (q, r) = tensor
+    let Qr { q, r } = tensor
         .qr(session)
         .map_err(|e| anyhow!("QR computation failed via tenferro-tensor: {e}"))?;
     Ok((
@@ -1714,12 +1771,9 @@ where
     )
     .map_err(|e| anyhow!("triangular solve rhs tensor construction failed: {e}"))?;
     let result = with_default_session(|session| {
-        a_tensor.triangular_solve(
+        a_tensor.triangular_solve_with(
             &b_tensor,
-            left_side,
-            lower,
-            transpose_a,
-            unit_diagonal,
+            &triangular_solve_options(left_side, lower, transpose_a, unit_diagonal),
             session,
         )
     })
@@ -1873,9 +1927,7 @@ fn full_piv_lu_tensor_in<T>(
 where
     T: BackendLinalgScalar,
 {
-    use tenferro_linalg::TensorLinalgExt;
-
-    let (p, l, u, q, _parity) = tensor
+    let FullPivLu { p, l, u, q, .. } = tensor
         .full_piv_lu(session)
         .map_err(|e| anyhow!("complete-pivoting LU failed via tenferro-tensor: {e}"))?;
     Ok(FullPivLuResult {

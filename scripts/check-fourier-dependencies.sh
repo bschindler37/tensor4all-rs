@@ -28,7 +28,7 @@ debug = 0
 default = ["partitioned"]
 partitioned = ["tensor4all-quanticstransform/partitioned"]
 
-[[bin]]
+[[example]]
 name = "patched_fourier"
 path = "../../crates/tensor4all-quanticstransform/examples/patched_fourier.rs"
 
@@ -42,14 +42,17 @@ path = "../../crates/tensor4all-quanticstransform/tests/patched_fourier.rs"
 
 [dependencies]
 num-complex = "0.4"
-tensor4all-core = { path = "../../crates/tensor4all-core", default-features = false, features = ["tenferro-cpu-platform"] }
-tensor4all-treetn = { path = "../../crates/tensor4all-treetn", default-features = false, features = ["tenferro-cpu-platform"] }
-tensor4all-partitionedtreetn = { path = "../../crates/tensor4all-partitionedtreetn", default-features = false, features = ["tenferro-cpu-platform"] }
-tensor4all-quanticstransform = { path = "../../crates/tensor4all-quanticstransform", default-features = false, features = ["tenferro-cpu-platform"] }
+tensor4all-core = { path = "../../crates/tensor4all-core", default-features = false }
+tensor4all-treetn = { path = "../../crates/tensor4all-treetn", default-features = false }
+tensor4all-partitionedtreetn = { path = "../../crates/tensor4all-partitionedtreetn", default-features = false }
+tensor4all-quanticstransform = { path = "../../crates/tensor4all-quanticstransform", default-features = false }
 
 [dev-dependencies]
-tensor4all-tensorbackend = { path = "../../crates/tensor4all-tensorbackend", default-features = false, features = ["tenferro-cpu-platform"] }
-tensor4all-treetci = { path = "../../crates/tensor4all-treetci", default-features = false, features = ["tenferro-cpu-platform"] }
+# The fixtures build tensors with the context-free API, which needs the
+# process-global route (tensor4all-rs#1403); the library graph above does not.
+tensor4all-core = { path = "../../crates/tensor4all-core", default-features = false, features = ["global-defaults"] }
+tensor4all-tensorbackend = { path = "../../crates/tensor4all-tensorbackend", default-features = false }
+tensor4all-treetci = { path = "../../crates/tensor4all-treetci", default-features = false }
 EOF
 
 manifest="$consumer/Cargo.toml"
@@ -64,5 +67,5 @@ echo "check-fourier-dependencies: the patched Fourier build has no SimpleTT or T
 if [[ ${1:-} == --run ]]; then
     build=(--locked --manifest-path "$manifest" --target-dir "${CARGO_TARGET_DIR:-target}")
     cargo test "${build[@]}" --test multiaxis_fourier --test patched_fourier
-    cargo run "${build[@]}" --bin patched_fourier
+    cargo run "${build[@]}" --example patched_fourier
 fi

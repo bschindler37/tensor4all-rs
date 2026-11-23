@@ -234,7 +234,7 @@ fn payload_storage_error_retains_typed_source() {
 #[test]
 fn materialization_error_retains_backend_source() {
     let native = NativeTensor::from_vec_col_major(vec![2, 3], vec![1.0_f64; 6]).unwrap();
-    let inner = EagerTensor::from_tensor_in(native, default_eager_ctx().unwrap()).unwrap();
+    let inner = default_eager_ctx().unwrap().constant_from(native).unwrap();
     let storage = IdxTensorStorage::Eager {
         inner: Arc::new(inner),
         axis_classes: vec![0, 0],
@@ -284,7 +284,7 @@ fn assert_unwrapped_conjugation_error(
 fn authoritative_storage_conjugation_failure_is_deferred_without_detaching() {
     let i = DynIndex::new_dyn(2);
     let native = NativeTensor::from_vec_col_major(vec![2], vec![1.0_f64, 2.0]).unwrap();
-    let inner = EagerTensor::requires_grad_in(native, default_eager_ctx().unwrap()).unwrap();
+    let inner = default_eager_ctx().unwrap().variable_from(native).unwrap();
     let tensor = IdxTensor::from_inner(vec![i], inner).unwrap();
     let source = match &tensor.storage {
         IdxTensorStorage::Eager { inner, .. } => Arc::clone(inner),
@@ -562,20 +562,18 @@ fn factorize_probe_batch_incremental_matches_the_column_based_path() {
 #[test]
 fn promote_eager_operands_casts_in_the_owner_runtime_and_keeps_grad() {
     let runtime = default_eager_ctx().unwrap();
-    let real_leaf = EagerTensor::requires_grad_in(
-        NativeTensor::from_vec_col_major(vec![2], vec![1.0_f64, 2.0]).unwrap(),
-        runtime.clone(),
-    )
-    .unwrap();
-    let complex_leaf = EagerTensor::requires_grad_in(
-        NativeTensor::from_vec_col_major(
-            vec![2],
-            vec![Complex64::new(3.0, 0.0), Complex64::new(4.0, 0.0)],
+    let real_leaf = runtime
+        .variable_from(NativeTensor::from_vec_col_major(vec![2], vec![1.0_f64, 2.0]).unwrap())
+        .unwrap();
+    let complex_leaf = runtime
+        .variable_from(
+            NativeTensor::from_vec_col_major(
+                vec![2],
+                vec![Complex64::new(3.0, 0.0), Complex64::new(4.0, 0.0)],
+            )
+            .unwrap(),
         )
-        .unwrap(),
-        runtime.clone(),
-    )
-    .unwrap();
+        .unwrap();
 
     let (real_cast, complex_cast) =
         IdxTensor::promote_eager_operands(&real_leaf, &complex_leaf).unwrap();
@@ -613,11 +611,9 @@ fn dims_of(indices: &[DynIndex]) -> Vec<usize> {
 }
 
 fn tracked_real_leaf(runtime: &Arc<EagerRuntime>, indices: &[DynIndex], data: &[f64]) -> IdxTensor {
-    let inner = EagerTensor::requires_grad_in(
-        NativeTensor::from_vec_col_major(dims_of(indices), data.to_vec()).unwrap(),
-        Arc::clone(runtime),
-    )
-    .unwrap();
+    let inner = runtime
+        .variable_from(NativeTensor::from_vec_col_major(dims_of(indices), data.to_vec()).unwrap())
+        .unwrap();
     IdxTensor::from_inner(indices.to_vec(), inner).unwrap()
 }
 
@@ -626,11 +622,9 @@ fn tracked_complex_leaf(
     indices: &[DynIndex],
     data: &[Complex64],
 ) -> IdxTensor {
-    let inner = EagerTensor::requires_grad_in(
-        NativeTensor::from_vec_col_major(dims_of(indices), data.to_vec()).unwrap(),
-        Arc::clone(runtime),
-    )
-    .unwrap();
+    let inner = runtime
+        .variable_from(NativeTensor::from_vec_col_major(dims_of(indices), data.to_vec()).unwrap())
+        .unwrap();
     IdxTensor::from_inner(indices.to_vec(), inner).unwrap()
 }
 
@@ -639,11 +633,9 @@ fn untracked_real_leaf(
     indices: &[DynIndex],
     data: &[f64],
 ) -> IdxTensor {
-    let inner = EagerTensor::from_tensor_in(
-        NativeTensor::from_vec_col_major(dims_of(indices), data.to_vec()).unwrap(),
-        Arc::clone(runtime),
-    )
-    .unwrap();
+    let inner = runtime
+        .constant_from(NativeTensor::from_vec_col_major(dims_of(indices), data.to_vec()).unwrap())
+        .unwrap();
     IdxTensor::from_inner(indices.to_vec(), inner).unwrap()
 }
 
@@ -652,11 +644,9 @@ fn untracked_complex_leaf(
     indices: &[DynIndex],
     data: &[Complex64],
 ) -> IdxTensor {
-    let inner = EagerTensor::from_tensor_in(
-        NativeTensor::from_vec_col_major(dims_of(indices), data.to_vec()).unwrap(),
-        Arc::clone(runtime),
-    )
-    .unwrap();
+    let inner = runtime
+        .constant_from(NativeTensor::from_vec_col_major(dims_of(indices), data.to_vec()).unwrap())
+        .unwrap();
     IdxTensor::from_inner(indices.to_vec(), inner).unwrap()
 }
 
@@ -711,12 +701,12 @@ fn check_mixed_dtype_gradient(
     let weight_data = gradient_weight(result.to_vec::<Complex64>().unwrap().len());
     let weight = IdxTensor::from_inner(
         result.indices().to_vec(),
-        EagerTensor::from_tensor_in(
-            NativeTensor::from_vec_col_major(dims_of(result.indices()), weight_data.clone())
-                .unwrap(),
-            Arc::clone(&runtime),
-        )
-        .unwrap(),
+        runtime
+            .constant_from(
+                NativeTensor::from_vec_col_major(dims_of(result.indices()), weight_data.clone())
+                    .unwrap(),
+            )
+            .unwrap(),
     )
     .unwrap();
 
@@ -1210,4 +1200,50 @@ fn min_nonzero_abs_keeps_the_smallest_complex_subnormals_nonzero() {
         assert!(value > 0.0 && value <= modulus, "{entry:e}: {value} u");
         assert_eq!(value.log2().floor(), modulus.log2().floor(), "{entry:e}");
     }
+}
+
+/// A context-scoped structured contraction of host-only operands runs on the
+/// caller's context and returns a value owned by it, not by the process-global
+/// runtime (#1403); the values match the context-free route.
+#[test]
+fn structured_host_contraction_in_context_stays_in_that_context() {
+    use tensor4all_tensorbackend::CpuExecutionContext;
+
+    let backend = tensor4all_tensorbackend::CpuBackend::with_threads(1).expect("1T CPU backend");
+    let context = Arc::new(CpuExecutionContext::from_backend(backend));
+    let execution = ExecutionContext::Cpu(Arc::clone(&context));
+    let i = DynIndex::new_dyn(3);
+    let j = DynIndex::new_dyn(3);
+    let k = DynIndex::new_dyn(3);
+    let diag = |values: Vec<f64>| Arc::new(Storage::new_diag(values).unwrap());
+    let lhs =
+        IdxTensor::from_storage(vec![i.clone(), j.clone()], diag(vec![1.0, 2.0, 3.0])).unwrap();
+    let rhs =
+        IdxTensor::from_storage(vec![j.clone(), k.clone()], diag(vec![4.0, 5.0, 6.0])).unwrap();
+    assert!(
+        lhs.storage.eager().is_none() && rhs.storage.eager().is_none(),
+        "precondition: host-only compact operands take the native route"
+    );
+
+    let scoped = lhs
+        .try_contract_pairwise_default_with_options_in(
+            &rhs,
+            PairwiseContractionOptions::new(),
+            &execution,
+        )
+        .unwrap();
+    let runtime = scoped
+        .storage
+        .eager()
+        .expect("the result wraps an eager payload")
+        .runtime();
+    assert_eq!(runtime.id(), context.eager_runtime().unwrap().id());
+
+    let implicit = lhs
+        .try_contract_pairwise_default_with_options(&rhs, PairwiseContractionOptions::new())
+        .unwrap();
+    assert_eq!(
+        scoped.to_vec::<f64>().unwrap(),
+        implicit.to_vec::<f64>().unwrap()
+    );
 }
