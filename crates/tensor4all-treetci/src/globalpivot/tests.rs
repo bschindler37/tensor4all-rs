@@ -1,11 +1,12 @@
 use super::{
     branch_slice_cache_max_bytes, cached_walk_readout, cached_walk_readout_on_session,
-    find_global_pivots, materialized_tree_bytes, retained_pivot_starts, search_with_readout,
-    ScalarParts, SearchParams,
+    enumeration_chunk_points, enumeration_points, find_global_pivots, materialized_tree_bytes,
+    maximal_enumeration_sides, retained_pivot_starts, search_thresholds, search_with_readout,
+    ScalarParts, SearchParams, LEAF_SIDE_ENUMERATION_BUDGET,
 };
 use crate::{
     materialize::to_treetn, optimize_with_proposer, AllEdges, DefaultProposer, GlobalIndexBatch,
-    TreeTCI2, TreeTciEdge, TreeTciGraph, TreeTciOptions,
+    StopRule, TreeTCI2, TreeTciEdge, TreeTciGraph, TreeTciOptions,
 };
 use anyhow::Result;
 use num_complex::{Complex32, Complex64};
@@ -116,11 +117,21 @@ fn confirmation_start_construction_rejects_missing_or_empty_pivots() {
 }
 
 #[test]
-fn sampled_residuals_are_preserved_below_the_discovery_margin() {
+fn search_acceptance_below_the_discovery_margin_follows_the_stop_rule() {
+    // abs_tol = 1 and margin 10: an error of 1.5 lies between the tolerance
+    // and the discovery margin, 15 lies above both. `Sampled` keeps an
+    // observed error above the tolerance (#1352); `PerBond` accepts only
+    // discoveries above the margin (#1405). Both report the measured error.
     let mut state =
         TreeTCI2::<f64>::new(vec![2, 2], TreeTciGraph::linear_chain(2).unwrap()).unwrap();
     state.add_global_pivots(&[vec![0, 0]]).unwrap();
-    for (error, expected_pivots) in [(0.25, vec![]), (1.5, vec![vec![0, 0]])] {
+    let cases = [
+        (StopRule::Sampled, 0.25, false),
+        (StopRule::Sampled, 1.5, true),
+        (StopRule::PerBond, 1.5, false),
+        (StopRule::PerBond, 15.0, true),
+    ];
+    for (stop_rule, error, accepted) in cases {
         let mut target = |batch: GlobalIndexBatch<'_>| Ok(vec![1.0; batch.n_points()]);
         let mut execution = crate::evaluation::Compatibility::new(&mut target);
         // Isolate search bookkeeping with a constant, exactly representable
@@ -140,6 +151,8 @@ fn sampled_residuals_are_preserved_below_the_discovery_margin() {
                 max_nglobal_pivot: 1,
                 abs_tol: 1.0,
                 tol_margin: 10.0,
+                enumeration_chunk_len: enumeration_chunk_points(state.local_dims.len()),
+                stop_rule,
             },
             &[vec![0, 0]],
             &mut seeded_rng(1),
@@ -147,9 +160,159 @@ fn sampled_residuals_are_preserved_below_the_discovery_margin() {
             cached_walk_readout_on_session,
         )
         .unwrap();
-        assert_eq!(result.max_error, error);
-        assert_eq!(result.pivots, expected_pivots);
+        let expected_pivots = if accepted { vec![vec![0, 0]] } else { vec![] };
+        assert_eq!(result.max_error, error, "{stop_rule:?}, error {error}");
+        assert_eq!(
+            result.pivots, expected_pivots,
+            "{stop_rule:?}, error {error}"
+        );
     }
+}
+
+#[test]
+fn per_bond_fallback_walks_accept_only_above_the_discovery_margin() {
+    // Site 1 has local dimension 1, so the retained tail pair and the
+    // subtree restart run when the ordinary walk keeps no pivot. With a
+    // constant residual every walk measures the same error: under `PerBond`
+    // an error of 1.5 (between abs_tol = 1 and the margin 10) is rejected by
+    // the ordinary walk and by the fallback walks, 15 is accepted by the
+    // ordinary walk and the fallback does not run. Under `Sampled` the
+    // ordinary walk keeps 1.5 already.
+    let mut state =
+        TreeTCI2::<f64>::new(vec![2, 1, 3], TreeTciGraph::linear_chain(3).unwrap()).unwrap();
+    state.add_global_pivots(&[vec![0, 0, 1]]).unwrap();
+    assert!(!retained_pivot_starts(&state, 1).unwrap().is_empty());
+    let search = |stop_rule: StopRule, error: f64| {
+        let readout_calls = std::cell::Cell::new(0usize);
+        let mut target = |batch: GlobalIndexBatch<'_>| Ok(vec![1.0; batch.n_points()]);
+        let mut execution = crate::evaluation::Compatibility::new(&mut target);
+        let readout = |_: &mut TreeTNCachedEvaluator<'_, usize>,
+                       _: &TreeTN<IdxTensor, usize>,
+                       _: &[DynIndex],
+                       points: ColMajorArrayRef<'_, usize>,
+                       _: Option<usize>| {
+            readout_calls.set(readout_calls.get() + 1);
+            Ok(vec![AnyScalar::new_real(1.0 - error); points.shape()[1]])
+        };
+        let result = search_with_readout(
+            &state,
+            &mut execution,
+            SearchParams {
+                nsearch: 1,
+                max_nglobal_pivot: 1,
+                abs_tol: 1.0,
+                tol_margin: 10.0,
+                enumeration_chunk_len: enumeration_chunk_points(state.local_dims.len()),
+                stop_rule,
+            },
+            &[],
+            &mut seeded_rng(1),
+            readout,
+            cached_walk_readout_on_session,
+        )
+        .unwrap();
+        assert_eq!(result.max_error, error, "{stop_rule:?}, error {error}");
+        (result.pivots.len(), readout_calls.get())
+    };
+    let (rejected, fallback_calls) = search(StopRule::PerBond, 1.5);
+    let (accepted, ordinary_calls) = search(StopRule::PerBond, 15.0);
+    assert_eq!(rejected, 0, "PerBond must reject an error below the margin");
+    assert_eq!(accepted, 1, "PerBond must accept an error above the margin");
+    assert!(
+        fallback_calls > ordinary_calls,
+        "the fallback walks must have run: {fallback_calls} vs {ordinary_calls} readouts"
+    );
+    assert_eq!(search(StopRule::Sampled, 1.5).0, 1);
+}
+
+#[test]
+fn per_bond_fallback_walks_reach_errors_above_a_margin_over_ten() {
+    // Review of #1446: with `tol_margin = 20` the `PerBond` fallback accepts
+    // only above `20 abs_tol`, so its walks must not stop at the first sweep
+    // that ends above `10 abs_tol`. The landscape is visible only to the walk
+    // that starts at the retained tail pivot [0, 0, 1] (the probe); every
+    // other readout (the ordinary walk, the restart, the enumeration) sees a
+    // constant error of 1.5. From [0, 0, 1] the first sweep reaches 15 at
+    // [0, 0, 0] (site 0 is scanned before site 2), the second reaches 25 at
+    // [1, 0, 0].
+    let mut state =
+        TreeTCI2::<f64>::new(vec![2, 1, 3], TreeTciGraph::linear_chain(3).unwrap()).unwrap();
+    let anchor = vec![0, 0, 1];
+    state
+        .add_global_pivots(std::slice::from_ref(&anchor))
+        .unwrap();
+    let landscape = |point: &[usize]| match (point[0], point[2]) {
+        (1, 0) => 25.0,
+        (0, 0) => 15.0,
+        _ => 1.5,
+    };
+    let search = |stop_rule: StopRule| {
+        let in_probe = std::cell::Cell::new(false);
+        let mut target = |batch: GlobalIndexBatch<'_>| Ok(vec![1.0; batch.n_points()]);
+        let mut execution = crate::evaluation::Compatibility::new(&mut target);
+        let readout = |_: &mut TreeTNCachedEvaluator<'_, usize>,
+                       _: &TreeTN<IdxTensor, usize>,
+                       _: &[DynIndex],
+                       points: ColMajorArrayRef<'_, usize>,
+                       scan_site: Option<usize>| {
+            let points: Vec<&[usize]> = points.data().chunks(points.shape()[0]).collect();
+            // A readout without a scan site starts a walk (or is the
+            // enumeration batch); only the probe starts at the anchor.
+            if scan_site.is_none() {
+                in_probe.set(points == [anchor.as_slice()]);
+            }
+            Ok(points
+                .into_iter()
+                .map(|point| {
+                    let error = if in_probe.get() {
+                        landscape(point)
+                    } else {
+                        1.5
+                    };
+                    AnyScalar::new_real(1.0 - error)
+                })
+                .collect())
+        };
+        search_with_readout(
+            &state,
+            &mut execution,
+            SearchParams {
+                nsearch: 1,
+                max_nglobal_pivot: 1,
+                abs_tol: 1.0,
+                tol_margin: 20.0,
+                enumeration_chunk_len: enumeration_chunk_points(state.local_dims.len()),
+                stop_rule,
+            },
+            &[],
+            &mut seeded_rng(1),
+            readout,
+            cached_walk_readout_on_session,
+        )
+        .unwrap()
+    };
+    let per_bond = search(StopRule::PerBond);
+    assert_eq!(per_bond.max_error, 25.0);
+    assert_eq!(per_bond.pivots, vec![vec![1, 0, 0]]);
+    // Up to a margin of 10 the walk threshold is `abs_tol` bit for bit; a
+    // non-round value catches `(abs_tol * 10) / 10`, one ulp off for some.
+    let abs_tol = 0.0034036185232215435;
+    for stop_rule in [StopRule::PerBond, StopRule::Sampled] {
+        for margin in [1.0, 10.0] {
+            let (_, _, walk) = search_thresholds(stop_rule, abs_tol, margin);
+            assert_eq!(
+                walk.to_bits(),
+                abs_tol.to_bits(),
+                "{stop_rule:?}, margin {margin}"
+            );
+        }
+    }
+    assert_eq!(
+        search_thresholds(StopRule::PerBond, abs_tol, 20.0).2,
+        2.0 * abs_tol
+    );
+    // `Sampled` keeps the constant 1.5 of the ordinary walk.
+    assert_eq!(search(StopRule::Sampled).pivots.len(), 1);
 }
 
 /// Batch evaluator for a two-peak function on a 10-site chain.
@@ -197,6 +360,7 @@ fn chain_graph() -> TreeTciGraph {
 fn options(enable_global_pivots: bool) -> TreeTciOptions {
     TreeTciOptions {
         tolerance: 1e-8,
+        stop_rule: StopRule::Sampled,
         max_iter: 30,
         max_bond_dim: None,
         scale_tolerance: true,
@@ -568,11 +732,13 @@ impl Fixture {
         self.one_sweep_state_with(self.evaluate())
     }
 
-    /// Full default optimization (global search on, fixed seed). Returns the
-    /// rank and error histories and the final state.
-    fn full_run(&self) -> (Vec<usize>, Vec<f64>, TreeTCI2<f64>) {
+    /// Full optimization with default options except the stop rule (global
+    /// search on, fixed seed). Returns the rank and error histories, the
+    /// evaluated point count and the final state.
+    fn full_run(&self, stop_rule: StopRule) -> (Vec<usize>, Vec<f64>, usize, TreeTCI2<f64>) {
         let mut tci = self.seeded_state();
         let options = TreeTciOptions {
+            stop_rule,
             seed: Some(1),
             ..TreeTciOptions::default()
         };
@@ -585,7 +751,12 @@ impl Fixture {
             &mut (),
         )
         .unwrap();
-        (report.ranks, report.errors, tci)
+        (
+            report.ranks,
+            report.errors,
+            report.evaluation.evaluated_points,
+            tci,
+        )
     }
 }
 
@@ -675,6 +846,8 @@ fn search_params<T>(state: &TreeTCI2<T>) -> SearchParams {
         max_nglobal_pivot: 5,
         tol_margin: 1.0,
         abs_tol: 1e-8 * state.max_sample_value,
+        enumeration_chunk_len: enumeration_chunk_points(state.local_dims.len()),
+        stop_rule: StopRule::Sampled,
     }
 }
 
@@ -948,8 +1121,43 @@ fn global_search_pivots_match_pointwise_reference_on_chain_and_branched_tree() {
     }
 }
 
+/// Evaluated points of the branched full runs, recorded on x86_64 Linux
+/// (`main` 050eb4ba, #1405; #1439 left it unchanged).
+const BRANCHED_EVALUATED_POINTS: usize = 161_713;
+
+/// Relative band around [`BRANCHED_EVALUATED_POINTS`] (#1447).
+const BRANCHED_EVALUATED_POINTS_BAND: f64 = 1e-3;
+
+/// The branched fixture's cost is pinned to a band, not to the exact count.
+///
+/// The fixture is exactly representable at rank 16, so after the first
+/// iteration the residuals the global search compares are rounding noise
+/// (about 1e-15, against the 1e-8 threshold). `floating_zone_walk` takes the
+/// greedy argmax of those residuals and stops on exact equality of the running
+/// maximum (`crates/tensor4all-core/src/floating_zone.rs:340-364`), so the number of
+/// walk evaluations follows the rounding of the approximation readout, which
+/// differs between CPU architectures. Measured:
+/// x86_64 Linux 161713; aarch64 macOS (Accelerate) and aarch64 Linux 161674,
+/// 39 (0.024%) fewer, from the second iteration on (38465 vs 38452 points).
+/// Ranks, the first-iteration error and the dense residual agree across the
+/// architectures and stay asserted. The band therefore guards the cost
+/// against a gross change only (the chain's count moved 22073 to 13754 with
+/// #1371); a change of a few dozen points on this fixture is not detected,
+/// and is the price of one count valid on both architectures. Do not re-pin
+/// the number to one platform.
+fn assert_branched_evaluated_points(evaluated_points: usize) {
+    let recorded = BRANCHED_EVALUATED_POINTS as f64;
+    assert!(
+        (evaluated_points as f64 - recorded).abs() <= BRANCHED_EVALUATED_POINTS_BAND * recorded,
+        "branched evaluated points {evaluated_points}, recorded {BRANCHED_EVALUATED_POINTS} \
+         within {BRANCHED_EVALUATED_POINTS_BAND}"
+    );
+}
+
 #[test]
 fn full_runs_reproduce_recorded_ranks_and_errors() {
+    // Pinned under `StopRule::Sampled`, the rule these values were recorded
+    // with (#1405).
     // Re-recorded after `AllEdges` started sweeping the second inner pass
     // backward (#899), with #812's retained-coordinate search: default
     // options, seed 1, global search enabled. No tolerance changed. Like
@@ -968,15 +1176,27 @@ fn full_runs_reproduce_recorded_ranks_and_errors() {
     // order): chain ranks [4, 8, 8, 8], errors [4.210785455368414e-9,
     // 7.104994852102056e-9, 6.760951106568071e-9, 6.850685368779623e-9];
     // branched ranks [4, 16, 16, 16].
-    let (ranks, errors, _) = chain_fixture().full_run();
-    assert_eq!(ranks, vec![4, 8, 8, 8, 8, 8]);
+    //
+    // The evaluated point counts were recorded on `main` 050eb4ba (#1405), so
+    // that a change of the stop rule shows up in the cost as well as in the
+    // ranks and errors.
+    //
+    // Re-recorded once more when the local truncation threshold of the
+    // sampled stop path started tightening after iterations whose recorded
+    // error fails the tolerance (#1371): the first iteration's 0.0128 halves
+    // it, and the chain now converges in four iterations. The prior recording
+    // (#1352) was ranks [4, 8, 8, 8, 8, 8], 22073 evaluated points, errors
+    // [0.012773153086831206, 1.0025709087768116e-8, 1.5404162097480518e-8,
+    // 9.492341846461125e-9, 9.314919862766571e-9, 9.549166222994594e-9]. The
+    // branched recording is unchanged.
+    let (ranks, errors, evaluated_points, _) = chain_fixture().full_run(StopRule::Sampled);
+    assert_eq!(ranks, vec![4, 8, 8, 8]);
+    assert_eq!(evaluated_points, 13754, "chain evaluated points");
     let recorded = [
         0.012773153086831206,
-        1.0025709087768116e-8,
-        1.5404162097480518e-8,
-        9.492341846461125e-9,
-        9.314919862766571e-9,
-        9.549166222994594e-9,
+        3.1243394479261807e-9,
+        3.308901600676769e-9,
+        3.292748132379448e-9,
     ];
     assert_eq!(errors.len(), recorded.len());
     // Errors are normalized to the sampled scale (about 1). Since #1352 some
@@ -993,8 +1213,9 @@ fn full_runs_reproduce_recorded_ranks_and_errors() {
     }
 
     let fixture = branched_fixture();
-    let (ranks, errors, state) = fixture.full_run();
+    let (ranks, errors, evaluated_points, state) = fixture.full_run(StopRule::Sampled);
     assert_eq!(ranks, vec![8, 16, 16, 16]);
+    assert_branched_evaluated_points(evaluated_points);
     // The first iteration's rank-8 approximation is not exact. Its error now
     // includes the residual the global search measured (#1352), instead of
     // only the rounding-level local bond error recorded before.
@@ -1041,6 +1262,40 @@ fn full_runs_reproduce_recorded_ranks_and_errors() {
         residual <= 1e-12 * scale,
         "branched full run differs from the target by {residual:e} (scale {scale:e})"
     );
+}
+
+#[test]
+fn full_runs_per_bond_reproduce_recorded_ranks_errors_and_points() {
+    // The default stop rule (#1405), recorded on its first implementation.
+    // The chain repeats the recording of 501ebb4a (before #1352) to the bit:
+    // the bond errors are the per-bond record, and the 10x margin rejects
+    // the sampled residuals between 1e-8 and 1.6e-8 that kept `Sampled`
+    // going for two more iterations (22073 points there).
+    let (ranks, errors, evaluated_points, _) = chain_fixture().full_run(StopRule::PerBond);
+    assert_eq!(ranks, vec![4, 8, 8, 8]);
+    assert_eq!(evaluated_points, 12720, "chain evaluated points");
+    let recorded = [
+        2.5205315287054708e-9,
+        6.416958743885642e-9,
+        9.666884024209921e-9,
+        9.666884024209921e-9,
+    ];
+    assert_eq!(errors.len(), recorded.len());
+    for (error, expected) in errors.iter().zip(recorded) {
+        assert!(
+            (error - expected).abs() <= 1e-9 * expected,
+            "chain errors {errors:?}, recorded {recorded:?}"
+        );
+    }
+
+    // The branched fixture takes the same path as under `Sampled`; only the
+    // first error differs, the bond error instead of the 0.446 residual the
+    // search measured. The dense check of the Sampled test covers the result.
+    let (ranks, errors, evaluated_points, _) = branched_fixture().full_run(StopRule::PerBond);
+    assert_eq!(ranks, vec![8, 16, 16, 16]);
+    assert_branched_evaluated_points(evaluated_points);
+    assert_eq!(errors.len(), 4);
+    assert!(errors.iter().all(|&error| error <= 1e-14), "{errors:?}");
 }
 
 #[test]
@@ -1091,6 +1346,8 @@ fn equal_errors_keep_generation_order_and_duplicates_collapse() {
             max_nglobal_pivot,
             tol_margin: 1.0,
             abs_tol: 0.5,
+            enumeration_chunk_len: enumeration_chunk_points(state.local_dims.len()),
+            stop_rule: StopRule::Sampled,
         };
         let mut rng = seeded_rng(5);
         run_search(&state, constant, params, &[], &mut rng, leveled_readout).unwrap()
@@ -1280,6 +1537,8 @@ fn coordinate_walk_honors_early_stop_and_sweep_bound() {
             max_nglobal_pivot: 1,
             tol_margin: 1.0,
             abs_tol: threshold,
+            enumeration_chunk_len: enumeration_chunk_points(state.local_dims.len()),
+            stop_rule: StopRule::Sampled,
         };
         let pivots = run_search(
             &state,
@@ -1513,4 +1772,386 @@ fn branch_slice_cache_cap_tracks_the_tree_above_the_default_floor() {
         branch_slice_cache_max_bytes::<Complex64>(&tree),
         tree_bytes * 2
     );
+}
+
+/// A state on `graph` with `local_dims`, for the side-selection tests, which
+/// read only the graph and the local dimensions.
+fn shape_state(local_dims: Vec<usize>, graph: TreeTciGraph) -> TreeTCI2<f64> {
+    TreeTCI2::<f64>::new(local_dims, graph).unwrap()
+}
+
+/// Selected sides, each sorted, in sorted order.
+fn sorted_sides(state: &TreeTCI2<f64>, limit: usize) -> Vec<Vec<usize>> {
+    let mut sides: Vec<Vec<usize>> = maximal_enumeration_sides(state, limit)
+        .unwrap()
+        .into_iter()
+        .map(|mut side| {
+            side.sort_unstable();
+            side
+        })
+        .collect();
+    sides.sort();
+    sides
+}
+
+/// The #1433 box tree: three binary chains of `r` sites joined at a unit
+/// centre, bit `i` of axis `j` at site `3 i + j`, the least significant bit at
+/// the leaf.
+fn three_branch_state(r: usize) -> TreeTCI2<f64> {
+    let centre = 3 * r;
+    let mut edges: Vec<TreeTciEdge> = (0..3)
+        .flat_map(|j| (0..r - 1).map(move |i| TreeTciEdge::new(3 * i + j, 3 * (i + 1) + j)))
+        .collect();
+    edges.extend((0..3).map(|j| TreeTciEdge::new(3 * (r - 1) + j, centre)));
+    let mut dims = vec![2; centre];
+    dims.push(1);
+    shape_state(dims, TreeTciGraph::new(centre + 1, &edges).unwrap())
+}
+
+#[test]
+fn enumeration_sides_are_the_low_bits_of_each_branch() {
+    let state = three_branch_state(7);
+    // The low `bits` bits of each axis: sites j, j + 3, ..., j + 3 (bits - 1).
+    let low_bits = |bits: usize| -> Vec<Vec<usize>> {
+        (0..3)
+            .map(|j| (0..bits).map(|i| 3 * i + j).collect())
+            .collect()
+    };
+    assert_eq!(LEAF_SIDE_ENUMERATION_BUDGET, 32);
+    // The budget is inclusive: 32 admits five bits, 31 only four.
+    assert_eq!(
+        sorted_sides(&state, LEAF_SIDE_ENUMERATION_BUDGET),
+        low_bits(5)
+    );
+    assert_eq!(sorted_sides(&state, 31), low_bits(4));
+    assert_eq!(sorted_sides(&state, 33), low_bits(5));
+    assert_eq!(sorted_sides(&state, 16), low_bits(4));
+    assert_eq!(sorted_sides(&state, 64), low_bits(6));
+    // A budget below two configurations selects nothing.
+    assert!(sorted_sides(&state, 1).is_empty());
+}
+
+#[test]
+fn enumeration_sides_on_a_chain_and_a_star() {
+    // Chain: the sides are prefixes and suffixes; the longest that fit win.
+    let chain = shape_state(vec![2; 6], TreeTciGraph::linear_chain(6).unwrap());
+    assert_eq!(sorted_sides(&chain, 8), vec![vec![0, 1, 2], vec![3, 4, 5]]);
+    assert_eq!(sorted_sides(&chain, 7), vec![vec![0, 1], vec![4, 5]]);
+
+    // Star with a unit centre: each leaf alone (2 configurations) or the
+    // centre with the three other leaves (8).
+    let edges: Vec<_> = (1..=4).map(|site| TreeTciEdge::new(0, site)).collect();
+    let star = shape_state(vec![1, 2, 2, 2, 2], TreeTciGraph::new(5, &edges).unwrap());
+    assert_eq!(
+        sorted_sides(&star, 4),
+        vec![vec![1], vec![2], vec![3], vec![4]]
+    );
+    assert_eq!(
+        sorted_sides(&star, 8),
+        vec![
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 4],
+            vec![0, 1, 3, 4],
+            vec![0, 2, 3, 4]
+        ]
+    );
+}
+
+#[test]
+fn enumeration_sides_use_the_product_of_local_dimensions() {
+    // Sides of the chain [3, 3, 4]: {0} 3, {0, 1} 9, {2} 4, {1, 2} 12.
+    let state = shape_state(vec![3, 3, 4], TreeTciGraph::linear_chain(3).unwrap());
+    assert_eq!(sorted_sides(&state, 8), vec![vec![0], vec![2]]);
+    assert_eq!(sorted_sides(&state, 9), vec![vec![0, 1], vec![2]]);
+    assert_eq!(sorted_sides(&state, 11), vec![vec![0, 1], vec![2]]);
+    assert_eq!(sorted_sides(&state, 12), vec![vec![0, 1], vec![1, 2]]);
+}
+
+#[test]
+fn enumeration_sides_exclude_sides_of_unit_vertices_only() {
+    // {0} and {0, 1} have one configuration; {2} is inside {1, 2}.
+    let state = shape_state(vec![1, 1, 2], TreeTciGraph::linear_chain(3).unwrap());
+    assert_eq!(sorted_sides(&state, 32), vec![vec![1, 2]]);
+    let units = shape_state(vec![1, 1], TreeTciGraph::linear_chain(2).unwrap());
+    assert!(sorted_sides(&units, 32).is_empty());
+}
+
+#[test]
+fn enumeration_points_cover_every_side_configuration_once() {
+    let dims = [3, 3, 4];
+    let sides = vec![vec![0, 1], vec![2]];
+    let anchor = vec![1, 1, 1];
+    // The anchor is reached from both sides, and a repeated anchor adds
+    // nothing: 9 + 4 - 1 points.
+    let points = enumeration_points(&[anchor.clone(), anchor.clone()], &sides, &dims);
+    let mut expected: Vec<Vec<usize>> = (0..3)
+        .flat_map(|a| (0..3).map(move |b| vec![a, b, 1]))
+        .chain((0..4).map(|c| vec![1, 1, c]))
+        .collect();
+    expected.sort();
+    expected.dedup();
+    assert_eq!(expected.len(), 12);
+    assert_eq!(points, expected);
+
+    // Two anchors that agree outside the side give the same points once.
+    let block = enumeration_points(&[vec![1, 1, 1], vec![0, 2, 1]], &[vec![0, 1]], &dims);
+    assert_eq!(block.len(), 9);
+    assert!(block.iter().all(|point| point[2] == 1));
+    // Two anchors that differ outside it give two blocks.
+    let two = enumeration_points(&[vec![1, 1, 1], vec![1, 1, 2]], &[vec![0, 1]], &dims);
+    assert_eq!(two.len(), 18);
+    assert!(enumeration_points(&[anchor], &[], &dims).is_empty());
+    assert!(enumeration_points(&[], &sides, &dims).is_empty());
+}
+
+/// A stream whose every draw is zero, so each random start and each restart
+/// coordinate of the stage-3 fixture is known.
+struct ZeroRng;
+
+impl rand::RngCore for ZeroRng {
+    fn next_u32(&mut self) -> u32 {
+        0
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        0
+    }
+
+    fn fill_bytes(&mut self, dst: &mut [u8]) {
+        dst.fill(0);
+    }
+}
+
+/// What one search on the stage-3 fixture returned and asked the target for.
+struct StageRun {
+    pivots: Vec<crate::MultiIndex>,
+    max_error: f64,
+    evaluated: Vec<Vec<usize>>,
+    batch_sizes: Vec<usize>,
+}
+
+/// The retained pivot of the stage-3 fixture.
+const STAGE_ANCHOR: [usize; 7] = [1, 1, 1, 0, 1, 1, 1];
+/// Stage-3 targets, at least two coordinate moves from every walk start.
+const STAGE_Q: [usize; 7] = [1, 0, 0, 0, 1, 0, 1];
+const STAGE_Q2: [usize; 7] = [1, 0, 1, 0, 0, 1, 1];
+const STAGE_Q3: [usize; 7] = [1, 1, 0, 0, 0, 1, 0];
+/// One move from the anchor, found by a retained-pivot probe.
+const PROBE_HIT: [usize; 7] = [1, 1, 1, 0, 1, 1, 0];
+/// One move from the first restart start [1, 1, 1, 0, 0, 0, 0].
+const RESTART_HIT: [usize; 7] = [1, 1, 1, 0, 1, 0, 0];
+/// One move from the uniform start, all zeros under [`ZeroRng`].
+const UNIFORM_HIT: [usize; 7] = [0, 0, 0, 0, 0, 0, 1];
+
+/// Search the chain `local_dims` (seven sites) holding the pivot
+/// [`STAGE_ANCHOR`], with residual `errors` at the listed points and zero
+/// elsewhere.
+///
+/// The target is `1 + error` and the readout is 1, so each residual is
+/// exactly its listed error. Two uniform walks start at the origin; with a
+/// unit site 3 the probes start at the anchor and the restarts at
+/// [1, 1, 1, 0, 0, 0, 0] and [0, 0, 0, 0, 1, 1, 1]. `abs_tol` is 1, and an
+/// error of 100 stops a walk at once. With `fail_batch_readout`, the readout
+/// fails on any unhinted batch of more than one point, which only stage 3
+/// asks for. Stage 3 uses the production chunk length, which holds the whole
+/// enumeration in one batch.
+fn stage_search(
+    local_dims: Vec<usize>,
+    errors: &[([usize; 7], f64)],
+    fail_batch_readout: bool,
+) -> crate::error::Result<StageRun> {
+    stage_search_chunked(
+        local_dims,
+        errors,
+        fail_batch_readout,
+        enumeration_chunk_points(7),
+    )
+}
+
+/// [`stage_search`] with stage 3 evaluated in batches of `chunk_len` points.
+fn stage_search_chunked(
+    local_dims: Vec<usize>,
+    errors: &[([usize; 7], f64)],
+    fail_batch_readout: bool,
+    chunk_len: usize,
+) -> crate::error::Result<StageRun> {
+    assert_eq!(rand::Rng::random_range(&mut ZeroRng, 0..2usize), 0);
+    let mut state =
+        TreeTCI2::<f64>::new(local_dims, TreeTciGraph::linear_chain(7).unwrap()).unwrap();
+    let anchor = STAGE_ANCHOR.to_vec();
+    state.add_global_pivots(&[anchor]).unwrap();
+    let evaluated = RefCell::new(Vec::new());
+    let batch_sizes = RefCell::new(Vec::new());
+    let mut target = |batch: GlobalIndexBatch<'_>| -> Result<Vec<f64>> {
+        batch_sizes.borrow_mut().push(batch.n_points());
+        Ok(batch
+            .data()
+            .chunks(batch.n_sites())
+            .map(|point| {
+                evaluated.borrow_mut().push(point.to_vec());
+                1.0 + errors
+                    .iter()
+                    .find(|(at, _)| at.as_slice() == point)
+                    .map_or(0.0, |&(_, error)| error)
+            })
+            .collect())
+    };
+    let readout = |_: &mut TreeTNCachedEvaluator<'_, usize>,
+                   _: &TreeTN<IdxTensor, usize>,
+                   _: &[DynIndex],
+                   points: ColMajorArrayRef<'_, usize>,
+                   site: Option<usize>|
+     -> Result<Vec<AnyScalar>> {
+        let n = points.shape()[1];
+        if fail_batch_readout && site.is_none() && n > 1 {
+            return Err(anyhow::anyhow!("stage-3 readout failure"));
+        }
+        Ok(vec![AnyScalar::new_real(1.0); n])
+    };
+    let mut execution = crate::evaluation::Compatibility::new(&mut target);
+    let result = search_with_readout(
+        &state,
+        &mut execution,
+        SearchParams {
+            nsearch: 2,
+            max_nglobal_pivot: 5,
+            tol_margin: 1.0,
+            abs_tol: 1.0,
+            enumeration_chunk_len: chunk_len,
+            stop_rule: StopRule::Sampled,
+        },
+        &[],
+        &mut ZeroRng,
+        readout,
+        cached_walk_readout_on_session,
+    )?;
+    Ok(StageRun {
+        pivots: result.pivots,
+        max_error: result.max_error,
+        evaluated: evaluated.into_inner(),
+        batch_sizes: batch_sizes.into_inner(),
+    })
+}
+
+/// The stage-3 fixture's local dimensions: a binary chain with a unit site 3.
+fn unit_chain() -> Vec<usize> {
+    vec![2, 2, 2, 1, 2, 2, 2]
+}
+
+#[test]
+fn enumeration_runs_when_probes_and_restarts_find_nothing() {
+    let run = stage_search(unit_chain(), &[(STAGE_Q, 2.0)], false).unwrap();
+    assert_eq!(run.pivots, vec![STAGE_Q.to_vec()]);
+    assert_eq!(run.max_error, 2.0);
+    // The sides {1, ..., 6} and {0, ..., 5} around the anchor hold 32
+    // configurations each and share the 16 with sites 0 and 6 at the anchor.
+    assert_eq!(run.batch_sizes.iter().filter(|&&n| n == 48).count(), 1);
+    assert_eq!(
+        run.evaluated
+            .iter()
+            .filter(|point| **point == STAGE_Q)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn enumeration_returns_points_above_abs_tol_strongest_first() {
+    let errors = [(STAGE_Q, 2.0), (STAGE_Q2, 3.0), (STAGE_Q3, 0.5)];
+    let run = stage_search(unit_chain(), &errors, false).unwrap();
+    // 0.5 is a sampled residual below `abs_tol`: recorded, not returned.
+    assert_eq!(run.pivots, vec![STAGE_Q2.to_vec(), STAGE_Q.to_vec()]);
+    assert_eq!(run.max_error, 3.0);
+    assert!(run.evaluated.contains(&STAGE_Q3.to_vec()));
+}
+
+#[test]
+fn enumeration_is_skipped_when_an_earlier_stage_finds_a_pivot() {
+    for (hit, label) in [
+        (PROBE_HIT, "probe"),
+        (RESTART_HIT, "restart"),
+        (UNIFORM_HIT, "uniform walk"),
+    ] {
+        let run = stage_search(unit_chain(), &[(hit, 100.0), (STAGE_Q, 1000.0)], false).unwrap();
+        assert_eq!(run.pivots, vec![hit.to_vec()], "{label}");
+        assert!(!run.evaluated.contains(&STAGE_Q.to_vec()), "{label}");
+        assert!(!run.batch_sizes.contains(&48), "{label}");
+    }
+}
+
+#[test]
+fn enumeration_needs_a_unit_vertex_for_its_anchors() {
+    // The same chain with a binary site 3 has no retained-pivot anchors, so
+    // neither the probes nor the enumeration run.
+    let run = stage_search(vec![2; 7], &[(STAGE_Q, 2.0)], false).unwrap();
+    assert!(run.pivots.is_empty());
+    assert_eq!(run.max_error, 0.0);
+    assert!(!run.evaluated.contains(&STAGE_Q.to_vec()));
+    assert!(run.batch_sizes.iter().all(|&n| n < 48));
+}
+
+#[test]
+fn enumeration_propagates_readout_failures() {
+    let error = stage_search(unit_chain(), &[], true).err().unwrap();
+    assert!(
+        error.to_string().contains("stage-3 readout failure"),
+        "{error}"
+    );
+}
+
+#[test]
+fn enumeration_chunks_bound_the_index_entries_per_batch() {
+    // 2^20 entries per batch, at least one point.
+    assert_eq!(enumeration_chunk_points(16), 1 << 16);
+    assert_eq!(enumeration_chunk_points(22), (1 << 20) / 22);
+    assert_eq!(enumeration_chunk_points(1001), 1047);
+    assert!(enumeration_chunk_points(1001) * 1001 <= 1 << 20);
+    assert_eq!(enumeration_chunk_points(1 << 20), 1);
+    assert_eq!(enumeration_chunk_points((1 << 20) + 1), 1);
+    assert_eq!(enumeration_chunk_points(0), 1 << 20);
+}
+
+#[test]
+fn enumeration_chunk_length_does_not_change_the_search() {
+    // Three stage-3 residuals, one below `abs_tol`, so the comparison covers
+    // the returned order, the filter and `max_error`.
+    let errors = [(STAGE_Q, 2.0), (STAGE_Q2, 3.0), (STAGE_Q3, 0.5)];
+    let single = stage_search(unit_chain(), &errors, false).unwrap();
+    // The production chunk holds the 48 enumeration points in the last batch.
+    assert_eq!(single.batch_sizes.last(), Some(&48));
+    let earlier_batches = single.batch_sizes.len() - 1;
+    assert_eq!(single.pivots, vec![STAGE_Q2.to_vec(), STAGE_Q.to_vec()]);
+    assert_eq!(single.max_error, 3.0);
+
+    // 1 and 48 bracket the range; 5 and 47 leave a short last batch; 0 is
+    // read as 1.
+    for (chunk_len, stage_batches) in [
+        (0, vec![1; 48]),
+        (1, vec![1; 48]),
+        (5, [vec![5; 9], vec![3]].concat()),
+        (47, vec![47, 1]),
+        (48, vec![48]),
+    ] {
+        let run = stage_search_chunked(unit_chain(), &errors, false, chunk_len).unwrap();
+        // The evaluator sees the same points in the same order, so with this
+        // deterministic target and constant readout every residual and its
+        // position agree with the single batch.
+        assert_eq!(run.evaluated, single.evaluated, "chunk {chunk_len}");
+        assert_eq!(
+            run.batch_sizes[..earlier_batches],
+            single.batch_sizes[..earlier_batches],
+            "chunk {chunk_len}"
+        );
+        assert_eq!(
+            run.batch_sizes[earlier_batches..],
+            stage_batches[..],
+            "chunk {chunk_len}"
+        );
+        assert_eq!(run.pivots, single.pivots, "chunk {chunk_len}");
+        assert_eq!(
+            run.max_error.to_bits(),
+            single.max_error.to_bits(),
+            "chunk {chunk_len}"
+        );
+    }
 }

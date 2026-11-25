@@ -1,7 +1,5 @@
 //! Deterministic execution of directional tree ACI passes.
 
-use tensor4all_treetn::{CanonicalForm, CanonicalizationOptions};
-
 use crate::{
     global_guard::{
         find_global_pivots, inject_global_pivots, per_evaluator_message_cache_budget,
@@ -29,29 +27,6 @@ pub(crate) struct PassReport {
     pub(crate) max_rank: usize,
     pub(crate) max_error: f64,
     pub(crate) evaluated_points: u64,
-}
-
-#[derive(Debug, Default)]
-struct UpdateTrace {
-    any: bool,
-    #[cfg(test)]
-    ordered: Vec<DirectedEdgeId>,
-}
-
-impl UpdateTrace {
-    fn with_capacity(_capacity: usize) -> Self {
-        Self {
-            any: false,
-            #[cfg(test)]
-            ordered: Vec::with_capacity(_capacity),
-        }
-    }
-
-    fn record(&mut self, _edge: DirectedEdgeId) {
-        self.any = true;
-        #[cfg(test)]
-        self.ordered.push(_edge);
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -253,34 +228,46 @@ where
     let schedule_acquire_started = std::time::Instant::now();
     let phases = match direction {
         PassDirection::Forward => state.problem.schedule.forward.clone(),
-        PassDirection::Reverse => state.problem.schedule.reverse.clone(),
+        // The return walk revisits the spine. A spine commit also reads the
+        // candidate set of every off-spine bond into its source node, and a
+        // Guard injection since the forward pass may have enlarged it. Such a
+        // bond is re-committed first, children first, or the spine commit can
+        // select an injected candidate its factor then drops, and the bond
+        // leaves the pivot basis (#1450). Without enlarged sets this is the
+        // stored spine walk.
+        PassDirection::Reverse => state.problem.schedule.reverse_with_recommits(|step| {
+            state.candidate_set_outgrew_basis(directed_edge_for_step(state, &step)?)
+        })?,
     };
     #[cfg(test)]
     crate::state::profile_debug_stats::record(|stats| {
         stats.schedule_acquire += schedule_acquire_started.elapsed();
     });
-    let mut update_trace = UpdateTrace::with_capacity(state.problem.directed_edges.len() / 2);
+    // The directed edges this pass commits, in order. Recorded only in test
+    // builds, where `PassReport::updated_edges` exposes them.
+    #[cfg(test)]
+    let mut updated_edges = Vec::with_capacity(state.problem.directed_edges.len() / 2);
     let mut evaluated_points = 0u64;
 
+    // A pass leaves the output as its commits wrote it. No canonicalization
+    // runs between passes: each bond axis k must keep denoting the k-th
+    // retained candidate of that bond on both adjacent cores, because the
+    // next commit writes its two cores on the incoming bonds in that basis. A
+    // generic canonicalization re-selects its own pivots and breaks that link
+    // (#1449).
     for phase in phases.iter() {
-        if let Err(error) = run_phase_serial(
+        run_phase_serial(
             state,
             options,
             phase,
             rank_hysteresis,
             operator,
-            &mut update_trace,
+            #[cfg(test)]
+            &mut updated_edges,
             &mut evaluated_points,
             exec,
-        ) {
-            if update_trace.any {
-                finalize_deferred_canonicalization(state, exec)?;
-            }
-            return Err(error);
-        }
+        )?;
     }
-
-    finalize_deferred_canonicalization(state, exec)?;
 
     let max_rank = state.edge_ranks.iter().copied().max().unwrap_or(1);
     let tolerance = options.tolerance_policy();
@@ -293,37 +280,11 @@ where
     Ok(PassReport {
         direction,
         #[cfg(test)]
-        updated_edges: update_trace.ordered,
+        updated_edges,
         max_rank,
         max_error,
         evaluated_points,
     })
-}
-
-fn finalize_deferred_canonicalization<T: TreeAciScalar, V: TreeAciNode>(
-    state: &mut TreeAciState<'_, T, V>,
-    exec: &mut crate::exec::Exec<'_, '_>,
-) -> Result<()> {
-    #[cfg(test)]
-    let canonicalization_started = std::time::Instant::now();
-    if state.output.canonical_form().is_none() {
-        let center = state
-            .output
-            .canonical_region()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        exec.canonicalize_mut(
-            &mut state.output,
-            center,
-            CanonicalizationOptions::default().with_form(CanonicalForm::CI),
-        )?;
-    }
-    #[cfg(test)]
-    crate::state::profile_debug_stats::record(|stats| {
-        stats.deferred_canonicalization += canonicalization_started.elapsed();
-    });
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,7 +294,7 @@ fn run_phase_serial<T, V, F>(
     phase: &PathPhase,
     rank_hysteresis: bool,
     operator: &mut F,
-    update_trace: &mut UpdateTrace,
+    #[cfg(test)] updated_edges: &mut Vec<DirectedEdgeId>,
     evaluated_points: &mut u64,
     exec: &mut crate::exec::Exec<'_, '_>,
 ) -> Result<()>
@@ -381,14 +342,16 @@ where
                 .ok_or(TreeAciError::SizeOverflow {
                     context: "pass evaluated point count",
                 })?;
-            update_trace.record(directed);
+            #[cfg(test)]
+            updated_edges.push(directed);
         }
     }
     Ok(())
 }
 
 // A stable maximum can hide growth on a smaller cut, particularly when the
-// forward walk visits side branches but the return visits only the spine.
+// forward walk visits side branches but the return visits only the spine
+// (and the side bonds a Guard injection enlarged).
 // Keep one rank per cut, updated in place once per pass: O(edges) storage and
 // work, with no extra contractions, samples, or per-pass allocations.
 fn track_rank_stability(previous: &mut [usize], current: &[usize], stable: usize) -> usize {

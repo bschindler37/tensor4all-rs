@@ -13,6 +13,27 @@
   and rank-goal numerical decisions are unchanged. The greedy reconstructor's
   `ReconstructionOptions::target_bond_dim` is unchanged.
 
+- TreeTCI's default stop rule is the per-bond rule again (#1405), the one of
+  TensorCrossInterpolation.jl, TreeTCI.jl and xfac: the recorded error is the largest
+  bond pivot error, and the global search accepts a pivot only above
+  `tolerance * tol_margin_global_search` (scaled by the sample magnitude when
+  `scale_tolerance` is on). The sampled stop of #1357, which also records the residuals
+  the global search measured and keeps observed errors above `tolerance`, stays available
+  as `TreeTciOptions { stop_rule: StopRule::Sampled, .. }` (and
+  `QtciOptions::with_stop_rule`). On the 16-site quantics chain of the treetci
+  full-run golden the sampled stop takes 1.74x the oracle evaluations of the per-bond
+  stop (22073 against 12720, six iterations against four); on the 16-site Gaussian
+  chain of #1371 it took 3.14x, 3.37x and 2.18x at tolerances 1e-4, 1e-6 and 1e-8
+  (six seeds summed), for the same true error. The unit-endpoint probes and subtree
+  restarts of #1357, the third search stage of #1433 and the #1434 proposer change stay
+  on both rules; under the per-bond rule their finds are accepted only above the
+  margin. Runs with the global search enabled can therefore stop earlier, with
+  different `errors`, than on the previous release; to keep the previous behaviour, set
+  `StopRule::Sampled` (Python: `crossinterpolate(..., stop_rule="sampled")`). The public
+  `find_global_pivots*` functions keep the sampled acceptance, and
+  `TreeTciInterpolator` always runs `StopRule::Sampled`, because the adaptive drivers
+  of tensor4all-partitionedtreetn accept a patch on its error estimate.
+
 - `tensor4all-hdf5` no longer sets `HDF5_USE_FILE_LOCKING=FALSE` on first use (#1386).
   The library never touches the process environment now. If you save and then re-open
   the same path in one process (or do so from several threads), set
@@ -176,6 +197,101 @@
   oracle-point cost at matched accuracy is 0.88–1.07x the previous one, and
   the reopened table needs about 25% fewer points. Trajectories on trees with
   such a vertex change, including the pinned #1153 junction ranks.
+- `tensor4all-treetci`: the global pivot search has a third stage (#1433).
+  When the uniform walks, the retained tail-pair probes and the subtree
+  restarts all find nothing, it evaluates, around the same retained tail
+  pivots, every configuration of each maximal edge side with at most 32 local
+  configurations, without random draws (in batches of at most 2^20 index
+  entries, which does not change the selected pivots). On binary quantics
+  chains that is the aligned block of width at most 32 around a pivot's value
+  of one variable, so a run can no longer stop `Converged` while a residual
+  above the tolerance lies in such a block in each of its three trailing
+  searches. Simon's box at `R = 7`, which stopped `Converged` with a dense
+  error of 0.75–0.875 on 9 of 11 seeds, is now exact on all 11. The budget is
+  fixed: the width-64 box at `R = 8` is still missed, and this is not a fix of
+  the zero-fiber defect class. Trees without a vertex of local dimension 1 are
+  unaffected, and so are runs with `nsearch = 0` or `max_nglobal_pivot = 0`,
+  where the stage does not run. On the #1153 comb, accuracy, ranks and termination are
+  unchanged and the oracle points grow by 1.32% at `delta = 1` (53,153 to
+  53,855) and 0.02% at `delta = 4` (1,125,824 to 1,126,042).
+- `tensor4all-treetci`: under `StopRule::Sampled`, the local rrLU truncation
+  threshold of each edge update now tightens when the recorded error fails
+  the tolerance (#1371). The default `StopRule::PerBond` is unaffected: its
+  factor stays exactly 1, `LocalThresholdFloor` is never reported, and its runs
+  are those before this change (its recorded error is the bond error alone,
+  which a `max_bond_dim` cap can keep above `tolerance`, so tightening on it
+  would change capped runs). The pinned `PerBond` runs match `main` in
+  termination, ranks and points exactly and in the recorded errors within
+  1e-9 relative; they were bit-identical in local measurements on Linux
+  x86_64. Under `Sampled`, local
+  truncation, global-search acceptance and the stop all used
+  `tolerance * max_sample_value`; a point whose error is spread over several
+  bonds sat above `tolerance` while every per-bond residual was below it, so
+  the sweeps dropped it every time and the run stopped only when three random
+  searches happened to miss it. The local threshold now starts at that value,
+  is halved after each iteration whose recorded error is not below
+  `tolerance`, never loosens, and never drops below `1 / E` of it (E tree
+  edges). The search acceptance and the stop tolerance are unchanged. A
+  `Sampled` run whose recorded error never reaches the tolerance takes the
+  same path as before. `TreeTciInterpolator` always runs `Sampled`, so the
+  change applies there too. New: `TreeTciTermination::LocalThresholdFloor`
+  (`Sampled` only), reported when three trailing sweeps at the `1 / E` floor
+  all record an error at or above the tolerance (instead of continuing to
+  `MaxIterations`; it maps to `InterpolationTermination::IterationLimit`). It
+  is armed only for trees with at least two edges: with one edge or none the
+  floor would be 1, the threshold cannot descend, and such runs end
+  `MaxIterations` or `Converged` as before. Also new is
+  `local_threshold_factor` on `TreeTciOptimizationResult` and
+  `TreeTciRunResult`, the factor the last sweep applied (`1.0` under
+  `PerBond` and for trees with fewer than two edges); see "Breaking Rust API
+  changes". On the #1371 reproducer under `Sampled` (16-site chain, seeds
+  1-6, `max_iter` 30) all 18 runs end `Converged` in 4-6 iterations (before:
+  5-30, two `MaxIterations`) with a dense error of 0.22-0.50x the tolerance
+  (before: up to 2.04x), at final factor 1/4 (one run 1/2); the oracle points
+  sum to 540,563 / 647,757 / 892,792 at 1e-4 / 1e-6 / 1e-8, 0.40x / 0.30x /
+  0.54x the previous `Sampled` cost and 1.25x / 1.02x / 1.19x that of
+  `PerBond` (433,152 / 634,331 / 753,077, as at `501ebb4a`). On a 60-site
+  slow-decay comb at 1e-8 (seeds 1-3) the `Sampled` runs end `Converged` in
+  5 / 5 / 8 iterations with 7.6M / 7.3M / 14.9M points (before: `MaxIterations`
+  at 30 with 59.9M / 59.3M / 61.8M; `PerBond`: 6.4M / 6.1M / 8.4M, so 1.19x /
+  1.19x / 1.78x) and a sampled error of 0.39-0.57x the tolerance (before:
+  1.26-2.28x). Trajectories of `Sampled` runs whose recorded error exceeds the
+  tolerance in some iteration change, including the pinned 16-site chain in
+  `full_runs_reproduce_recorded_ranks_and_errors` (4 iterations and 13,754
+  points instead of 6 and 22,073; `PerBond` takes 4 and 12,720).
+- `tensor4all-treeaci`: a run no longer canonicalizes its output (#1449), so
+  `tree_elementwise`, `tree_elementwise_batched*`, `hadamard_many` and
+  `TreeAciInterpolator` results now report `tree.canonical_form() == None`
+  instead of `Some(CanonicalForm::CI)`; the canonical region is still the node
+  of the last commit. The CI canonicalization after the first pass re-selected
+  its own pivots and moved bonds out of the basis that later commits read (bond
+  axis `k` = the `k`-th retained candidate), and the spine-only return pass then
+  committed against them: on the #1449 reproducer a run stopped `Converged` at
+  the true ranks with a recorded error of 4.4e-16 and a dense relative error of
+  1.58. Measured on the #1449 reproducers (the full and the reduced tree, Guard
+  on and off, 11 seeds each; see #1453), no run now stops at a false
+  `Converged`; the committed regression test pins the reduced tree with the
+  Guard off and seed 1. This is not established in general: a reverse cleanup
+  pass that consumed Guard-injected candidates could still return a tree
+  outside the pivot basis (#1450, fixed in the entry below). An initial guess's canonical form is cleared at
+  initialization instead of being passed through to the result. Callers that
+  need a canonical form canonicalize the result themselves. The rustdoc of
+  `TreeAciResult::max_errors` and `TreeAciOptions::tolerance` now states what
+  the recorded per-edge residual measures (the output's error at commit time
+  over that commit's local matrix, while the bonds it reads are in that basis)
+  and what it does not bound (the dense error, later commits, pass-1
+  residuals).
+- `tensor4all-treeaci`: the return pass also re-commits, children first, every
+  off-spine bond whose candidate set a Guard injection enlarged, before the
+  spine commit that reads it (#1450). Before, it re-committed only the spine,
+  so a spine commit could select an injected candidate that its factor then
+  dropped, and that bond left the pivot basis (bond axis `k` = the `k`-th
+  retained candidate). With `max_sweeps = min_sweeps = 1` the cleanup return
+  pass returned such a tree: on G0 r = 5 (comb tree, seed 42, tolerance 1e-3)
+  max|M - I| was 0.76 and is now 0, at 9,196 oracle points instead of 3,556.
+  Runs whose Guard injects after a forward pass change their trajectory; on the
+  G0 r = 5-8 comb and swap workloads the median oracle points at matched
+  accuracy changed by 1.00-1.17x per workload. Runs without such an injection are unchanged.
 
 ### Added
 
@@ -225,6 +341,13 @@
   axes at R = 20 now fit in memory.
 
 ### Breaking Rust API changes
+
+- `tensor4all-treetci`: `TreeTciOptimizationResult` and `TreeTciRunResult`
+  have a new public field, `local_threshold_factor: f64` (#1371). Neither
+  struct is `#[non_exhaustive]`, so downstream struct literals and
+  destructuring patterns without `..` must add the field. The new
+  `TreeTciTermination::LocalThresholdFloor` variant is not breaking: that enum
+  is `#[non_exhaustive]`.
 
 - `tensor4all-aci`: `AciError` has a new `Backend { operation, source }` variant (#1382).
   A matrix product of the ACI sweep that the execution context refuses (for example a

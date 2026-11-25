@@ -56,6 +56,19 @@ fn map_termination_applies_the_cap_precedence() {
             None,
             InterpolationTermination::IterationLimit,
         ),
+        // The local threshold floor (#1371) is a limit of the engine's own.
+        (
+            TreeTciTermination::LocalThresholdFloor,
+            2,
+            cap,
+            InterpolationTermination::IterationLimit,
+        ),
+        (
+            TreeTciTermination::LocalThresholdFloor,
+            2,
+            None,
+            InterpolationTermination::IterationLimit,
+        ),
         // An unmeasured error is never accepted, below the cap or not.
         (
             TreeTciTermination::DegenerateCandidateSet,
@@ -468,4 +481,26 @@ fn interpolator_forwards_problem_global_search_starts() {
             "a non-corner point should stay at 1, got {value}"
         );
     });
+}
+
+#[test]
+fn run_options_use_the_sampled_stop_rule() {
+    // The adaptive drivers accept a patch on the reported error estimate, a
+    // pointwise check; only `Sampled` records the search residuals (#1405).
+    // The engine's own `stop_rule` must not leak into a run.
+    for stop_rule in [StopRule::PerBond, StopRule::Sampled] {
+        let engine = TreeTciInterpolator::new(TreeTciOptions {
+            stop_rule,
+            ..Default::default()
+        })
+        .unwrap();
+        let options = engine.run_options(1e-10, None, 7);
+        assert_eq!(options.stop_rule, StopRule::Sampled, "engine {stop_rule:?}");
+    }
+    assert_eq!(
+        TreeTciInterpolator::default()
+            .run_options(1e-10, None, 7)
+            .stop_rule,
+        StopRule::Sampled
+    );
 }

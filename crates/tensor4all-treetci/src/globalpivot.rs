@@ -17,7 +17,7 @@ use crate::error::{Result as TreeTciResult, TreeTciError};
 use crate::evaluation::{BatchExecution, Compatibility};
 use crate::{
     batch::EVALUATION_CHUNK_POINTS, materialize::to_treetn_chunked, GlobalIndexBatch, MultiIndex,
-    SubtreeKey, TreeTCI2,
+    StopRule, SubtreeKey, TreeTCI2,
 };
 use anyhow::Result;
 use rand::{Rng, RngCore, SeedableRng};
@@ -41,13 +41,36 @@ use tensor4all_treetn::{CachedEvaluatorOptions, EvaluationHint, TreeTN, TreeTNCa
 ///    coordinate between site scans and repeating sweeps until no improvement,
 ///    an error above `10 * abs_tol * tol_margin`, or 100 sweeps.
 /// 4. Prefer points above `abs_tol * tol_margin`. If none cross that margin,
-///    keep observed errors above `abs_tol` instead.
+///    keep observed errors above `abs_tol` instead. This is the acceptance of
+///    [`StopRule::Sampled`](crate::StopRule::Sampled); the optimizer under the
+///    default [`StopRule::PerBond`](crate::StopRule::PerBond) accepts only
+///    points above `abs_tol * tol_margin`, here and in steps 5 and 6.
 /// 5. If no point qualifies, confirm retained tail pivot pairs at edges with
 ///    a dimension-one endpoint, then randomize their complementary subtrees
 ///    while holding one observed subtree fixed. Each family adds at most
-///    `nsearch` walks, using `abs_tol` as its threshold. This helps a sparse
-///    target whose random starts fall on zero fibers.
-/// 6. Return at most `max_nglobal_pivot` distinct points.
+///    `nsearch` walks. These functions, like the optimizer under
+///    [`StopRule::Sampled`](crate::StopRule::Sampled), accept a point above
+///    `abs_tol`; under [`StopRule::PerBond`](crate::StopRule::PerBond) the
+///    optimizer accepts only above `abs_tol * tol_margin`. Each walk stops
+///    after the first sweep above ten times its walk threshold: `abs_tol`,
+///    or `abs_tol * max(1, tol_margin / 10)` under `PerBond`.
+///    This helps a sparse target whose random starts fall on zero fibers.
+/// 6. If both of those families also found nothing, enumerate around the same
+///    retained tail pivots (deduplicated): for every edge side whose product
+///    of local dimensions is between 2 and 32, keeping the maximal such sides,
+///    evaluate every configuration of the side with the other sites held at
+///    the pivot, in batches of at most 2^20 index entries (`points *
+///    n_sites`, but at least one point per batch); the batching changes
+///    neither the residuals, their order nor the result. Points qualify
+///    against the same acceptance threshold as those families: `abs_tol`
+///    here and under `Sampled`, `abs_tol * tol_margin` under `PerBond`. There
+///    is no walk and no random draw. On binary quantics chains with the least significant bit at the leaf, this
+///    exhaustively covers the aligned block of width at most 32 around each
+///    pivot's value of one variable, and nothing wider. The stage does not
+///    run when `nsearch` is zero or the tree has no dimension-one vertex (no
+///    anchors), when no edge side has 2 to 32 configurations, or when
+///    `max_nglobal_pivot` is zero (the search returns before any stage).
+/// 7. Return at most `max_nglobal_pivot` distinct points.
 ///
 /// Caller-supplied starts let a caller aim the search at a region it already
 /// suspects, such as a corner of a patch. A corner-localized feature otherwise
@@ -70,11 +93,13 @@ use tensor4all_treetn::{CachedEvaluatorOptions, EvaluationHint, TreeTN, TreeTNCa
 ///   [`optimize_with_proposer`](crate::optimize_with_proposer).
 /// * `nsearch` -- number of random starting points, drawn after the
 ///   caller-supplied starts; also bounds each confirmation family at unit
-///   endpoints. Zero disables both random and confirmation starts.
+///   endpoints and the number of enumeration anchors of step 6. Zero disables
+///   random starts, confirmation starts and the enumeration.
 /// * `starts` -- caller-supplied starting points as full-site multi-indices,
 ///   walked before the random ones. Each must have one coordinate per site and
 ///   an in-range coordinate. An empty slice adds none.
-/// * `max_nglobal_pivot` -- maximum number of pivots returned.
+/// * `max_nglobal_pivot` -- maximum number of pivots returned. Zero returns
+///   no pivot without evaluating anything, so none of the stages above runs.
 /// * `tol_margin` -- discovery margin over `abs_tol`; when no discovery
 ///   crosses it, observed tolerance violations can still be returned.
 /// * `abs_tol` -- absolute interpolation-error threshold.
@@ -201,6 +226,8 @@ where
     let mut stream: &mut R = rng;
     let mut evaluate = evaluate;
     let mut execution = Compatibility::new(&mut evaluate);
+    // The public finders keep the `Sampled` acceptance (#1405): observed
+    // errors above `abs_tol` qualify when no discovery crosses the margin.
     find_global_pivots_erased(
         state,
         &mut execution,
@@ -209,6 +236,7 @@ where
         max_nglobal_pivot,
         tol_margin,
         abs_tol,
+        StopRule::Sampled,
         &mut stream,
     )
     .map(|result| result.pivots)
@@ -230,6 +258,7 @@ pub(crate) fn find_global_pivots_erased<T>(
     max_nglobal_pivot: usize,
     tol_margin: f64,
     abs_tol: f64,
+    stop_rule: StopRule,
     rng: &mut dyn RngCore,
 ) -> TreeTciResult<GlobalPivotSearchResult>
 where
@@ -240,6 +269,8 @@ where
         max_nglobal_pivot,
         tol_margin,
         abs_tol,
+        enumeration_chunk_len: enumeration_chunk_points(state.local_dims.len()),
+        stop_rule,
     };
     search_with_readout(
         state,
@@ -250,6 +281,28 @@ where
         cached_walk_readout,
         cached_walk_readout_on_session::<T>,
     )
+}
+
+/// The thresholds of one search under `stop_rule`, as
+/// `(acceptance_floor, fallback_threshold, fallback_walk_threshold)`.
+///
+/// `acceptance_floor` qualifies the ordinary walks; `fallback_threshold` is
+/// the one acceptance threshold of every fallback stage (the probes, the
+/// restarts and the stage-3 enumeration of #1433); the probe and restart
+/// walks stop after the first sweep above ten times `fallback_walk_threshold`.
+/// `PerBond` accepts only discoveries above the margin; `Sampled` keeps
+/// observed errors above `abs_tol` (#1352).
+// INVARIANT: the only place the stop rule enters the search (#1405).
+fn search_thresholds(stop_rule: StopRule, abs_tol: f64, tol_margin: f64) -> (f64, f64, f64) {
+    let threshold = abs_tol * tol_margin;
+    match stop_rule {
+        // With `abs_tol` as walk threshold, a margin above 10 would end every
+        // fallback walk below `threshold` (review of #1446). INVARIANT: the
+        // factor is exactly 1.0 for any margin up to 10, so the walk
+        // threshold is `abs_tol` bit for bit there, as on `main`.
+        StopRule::PerBond => (threshold, threshold, abs_tol * (tol_margin / 10.0).max(1.0)),
+        StopRule::Sampled => (abs_tol.min(threshold), abs_tol, abs_tol),
+    }
 }
 
 /// Pivots plus the largest actual residual sampled by a search.
@@ -324,14 +377,125 @@ fn retained_pivot_starts<T>(
     Ok(starts)
 }
 
+/// Configuration budget of one subtree in the enumeration that is the third
+/// search stage, after the walks and the confirmation families (step 6 of
+/// [`find_global_pivots`]).
+///
+/// The enumeration visits every configuration of each maximal edge side with
+/// at most this many local configurations, holding the other sites at a
+/// retained anchor. On a quantics tree whose variables are binary chains with
+/// the least significant bit at the leaf, such a side is the low
+/// `log2(32) = 5` bits of one variable, so the stage exhaustively searches the
+/// aligned block of width at most 32 that contains the anchor's value of that
+/// variable. Nothing outside those blocks is enumerated: a defect whose
+/// aligned block around the anchor is wider, such as the width-64 box at
+/// `R = 8` of issue #1433, is not covered. This bounds a search; it is not an
+/// error certificate.
+const LEAF_SIDE_ENUMERATION_BUDGET: usize = 32;
+
+/// Index entries (`points * n_sites`) sent to the evaluator in one batch of
+/// the third-stage enumeration.
+///
+/// The enumeration has at most `anchors * sum(side configurations)` points,
+/// with at most `nsearch` anchors and up to `2 (n_sites - 1)` maximal sides of
+/// at most [`LEAF_SIDE_ENUMERATION_BUDGET`] configurations each. On a star of
+/// `k` five-site binary chains joined at a dimension-one centre, for example,
+/// that is about `31 k` points per anchor, each `5 k + 1` sites long. Chunking
+/// keeps the batch buffer at 2^20 entries (8 MiB) whatever the tree; the
+/// deduplicated point set itself still holds every point.
+const ENUMERATION_CHUNK_ENTRIES: usize = 1 << 20;
+
+/// Points per evaluation batch of the third-stage enumeration: the largest
+/// count whose index entries fit [`ENUMERATION_CHUNK_ENTRIES`], and at least
+/// one point.
+fn enumeration_chunk_points(n_sites: usize) -> usize {
+    (ENUMERATION_CHUNK_ENTRIES / n_sites.max(1)).max(1)
+}
+
+/// Edge sides that the third-stage enumeration visits exhaustively.
+///
+/// Takes every side of every edge (either side) whose product of local
+/// dimensions lies in `2..=limit` and keeps those not strictly contained in
+/// another such side. A side made only of dimension-one vertices has a single
+/// configuration and is never selected. Each side is returned as its vertex
+/// list, in graph edge order.
+///
+/// # Errors
+///
+/// Fails when the graph cannot split one of its own edges.
+fn maximal_enumeration_sides<T>(
+    state: &TreeTCI2<T>,
+    limit: usize,
+) -> TreeTciResult<Vec<Vec<usize>>> {
+    let mut fitting: Vec<Vec<usize>> = Vec::new();
+    for edge in state.graph.edges() {
+        let (left, right) = state.graph.subregion_vertices(edge)?;
+        for side in [left, right] {
+            let configurations = side.as_slice().iter().try_fold(1usize, |count, &site| {
+                count
+                    .checked_mul(state.local_dims[site])
+                    .filter(|&count| count <= limit)
+            });
+            if configurations.is_some_and(|count| count > 1) {
+                fitting.push(side.as_slice().to_vec());
+            }
+        }
+    }
+    let contains = |outer: &[usize], inner: &[usize]| {
+        outer.len() > inner.len() && inner.iter().all(|site| outer.contains(site))
+    };
+    Ok(fitting
+        .iter()
+        .filter(|side| !fitting.iter().any(|other| contains(other, side)))
+        .cloned()
+        .collect())
+}
+
+/// All points that agree with an anchor outside one side, deduplicated and in
+/// lexicographic order.
+///
+/// For each anchor and each side, every configuration of the side's sites is
+/// combined with the anchor's coordinates elsewhere. A point reached from
+/// several anchors or sides (the anchor itself, at least) appears once. The
+/// count is at most `anchors.len()` times the sum of the sides' configuration
+/// counts.
+fn enumeration_points(
+    anchors: &[MultiIndex],
+    sides: &[Vec<usize>],
+    local_dims: &[usize],
+) -> Vec<MultiIndex> {
+    let mut points = std::collections::BTreeSet::new();
+    for anchor in anchors {
+        for side in sides {
+            let configurations: usize = side.iter().map(|&site| local_dims[site]).product();
+            for code in 0..configurations {
+                let mut point = anchor.clone();
+                let mut rest = code;
+                for &site in side {
+                    point[site] = rest % local_dims[site];
+                    rest /= local_dims[site];
+                }
+                points.insert(point);
+            }
+        }
+    }
+    points.into_iter().collect()
+}
+
 /// Scalar parameters of one global pivot search, as passed to
-/// [`find_global_pivots`].
+/// [`find_global_pivots`], plus the third-stage chunk length.
 #[derive(Clone, Copy, Debug)]
 struct SearchParams {
     nsearch: usize,
     max_nglobal_pivot: usize,
     tol_margin: f64,
     abs_tol: f64,
+    /// Points per evaluation batch of the third-stage enumeration; zero is
+    /// read as one. Production passes [`enumeration_chunk_points`] of the
+    /// site count; tests pass smaller values to split the enumeration.
+    enumeration_chunk_len: usize,
+    /// Which acceptance applies (see [`StopRule`]).
+    stop_rule: StopRule,
 }
 
 /// A session-taking approximation readout for runs that own an [`EvalContext`].
@@ -458,6 +622,8 @@ where
         max_nglobal_pivot,
         tol_margin,
         abs_tol,
+        enumeration_chunk_len,
+        stop_rule,
     } = params;
     if !abs_tol.is_finite() || abs_tol < 0.0 {
         return Err(
@@ -543,7 +709,8 @@ where
     let mut flat = Vec::with_capacity(flat_capacity);
     let mut start = Vec::with_capacity(n_sites);
     let threshold = abs_tol * tol_margin;
-    let acceptance_floor = abs_tol.min(threshold);
+    let (acceptance_floor, fallback_threshold, fallback_walk_threshold) =
+        search_thresholds(stop_rule, abs_tol, tol_margin);
     let mut max_error = 0.0_f64;
     let mut best = Vec::with_capacity(starts.len().saturating_add(nsearch));
     for provided in starts {
@@ -598,11 +765,13 @@ where
     // factor). Retained pivot pairs stay on observed support and expose
     // inconsistencies between neighboring updates. Probe the tail pivots,
     // where a newly discovered direction is most easily lost, only when the
-    // ordinary search found no pivot. Confirmation uses the requested
-    // tolerance rather than the discovery margin. The loop runs at most
-    // nsearch times; each pass walks at most one retained pair and one
-    // subtree-anchored restart, so at most 2 * nsearch walks are added (a
-    // probe that finds an error skips its restart). Scratch is reused.
+    // ordinary search found no pivot. Their walks stop early on
+    // `fallback_walk_threshold`; what they find is accepted above
+    // `fallback_threshold`. The
+    // loop runs at most nsearch times; each pass walks at most one retained
+    // pair and one subtree-anchored restart, so at most 2 * nsearch walks are
+    // added (a probe that finds an error skips its restart). Scratch is
+    // reused.
     if best.is_empty() {
         let retained = retained_pivot_starts(state, nsearch)?;
         let mut support_start = vec![0; n_sites];
@@ -617,12 +786,12 @@ where
                     n_sites,
                     &mut flat,
                     &anchor.point,
-                    abs_tol,
+                    fallback_walk_threshold,
                     &mut readout,
                     readout_on_session,
                 )?;
                 max_error = max_error.max(error);
-                if error > abs_tol {
+                if error > fallback_threshold {
                     best.push((error, point));
                     continue;
                 }
@@ -643,13 +812,55 @@ where
                 n_sites,
                 &mut flat,
                 &support_start,
-                abs_tol,
+                fallback_walk_threshold,
                 &mut readout,
                 readout_on_session,
             )?;
             max_error = max_error.max(error);
-            if error > abs_tol {
+            if error > fallback_threshold {
                 best.push((error, point));
+            }
+        }
+
+        // Third stage (#1433): both confirmation families found nothing. A
+        // coordinate walk needs a nonzero residual one move from its start,
+        // which a defect several coordinates away from every start never
+        // offers. Enumerate the small subtrees around the same retained
+        // anchors exhaustively instead: no walk and no random draw, so the
+        // stream and the earlier stages are unchanged.
+        if best.is_empty() {
+            let anchors: Vec<MultiIndex> = retained.into_iter().map(|start| start.point).collect();
+            let points = if anchors.is_empty() {
+                Vec::new()
+            } else {
+                let sides = maximal_enumeration_sides(state, LEAF_SIDE_ENUMERATION_BUDGET)?;
+                enumeration_points(&anchors, &sides, &state.local_dims)
+            };
+            // Chunked so that the index buffer stays bounded on large trees.
+            // `batch_residuals` computes each residual from its own point, so
+            // the residuals, their order and the returned set are the same as
+            // for one batch. `enumeration_chunk_length_does_not_change_the_search`
+            // checks the evaluated point sequence, the batch sizes, the
+            // returned pivots and `max_error` for several chunk lengths.
+            for chunk in points.chunks(enumeration_chunk_len.max(1)) {
+                let errors = batch_residuals(
+                    execution,
+                    &mut cache,
+                    &treetn,
+                    &site_indices,
+                    n_sites,
+                    &mut flat,
+                    chunk,
+                    None,
+                    &mut readout,
+                    readout_on_session,
+                )?;
+                for (error, point) in errors.into_iter().zip(chunk) {
+                    max_error = max_error.max(error);
+                    if error > fallback_threshold {
+                        best.push((error, point.clone()));
+                    }
+                }
             }
         }
     }
@@ -709,68 +920,18 @@ where
         100,
         10.0 * threshold,
         |scan_site, points| {
-            flat.clear();
-            for point in points {
-                flat.extend_from_slice(point);
-            }
-            let f_values = execution.call(GlobalIndexBatch::new(flat, n_sites, points.len())?)?;
-            if f_values.len() != points.len() {
-                return Err(anyhow::anyhow!(
-                    "batch evaluator returned {} values for {} global-pivot candidates",
-                    f_values.len(),
-                    points.len(),
-                ));
-            }
-            let shape = [n_sites, points.len()];
-            let values = ColMajorArrayRef::new(flat, &shape).map_err(|error| {
-                anyhow::anyhow!("failed to build candidate index array: {error}")
-            })?;
-            let errors: Vec<f64> = match execution.session() {
-                Some(engine) => {
-                    let mut session = tensor4all_tensorbackend::explicit::Session::new(engine);
-                    let tt_values: Vec<T> = readout_on_session(
-                        cache,
-                        treetn,
-                        site_indices,
-                        values,
-                        scan_site,
-                        &mut session,
-                    )?;
-                    if tt_values.len() != points.len() {
-                        return Err(anyhow::anyhow!(
-                            "approximation readout returned {} values for {} global-pivot \
-                             candidates",
-                            tt_values.len(),
-                            points.len(),
-                        ));
-                    }
-                    f_values
-                        .into_iter()
-                        .zip(tt_values)
-                        .map(|(f, tt)| typed_interp_error(f, tt))
-                        .collect()
-                }
-                None => {
-                    let tt_values = readout(cache, treetn, site_indices, values, scan_site)?;
-                    if tt_values.len() != points.len() {
-                        return Err(anyhow::anyhow!(
-                            "approximation readout returned {} values for {} global-pivot \
-                             candidates",
-                            tt_values.len(),
-                            points.len(),
-                        ));
-                    }
-                    f_values
-                        .into_iter()
-                        .zip(tt_values)
-                        .map(|(f, tt)| interp_error(f, tt))
-                        .collect()
-                }
-            };
-            if errors.iter().any(|error| !error.is_finite()) {
-                return Err(anyhow::anyhow!("non-finite global pivot residual"));
-            }
-            Ok(errors)
+            batch_residuals(
+                execution,
+                cache,
+                treetn,
+                site_indices,
+                n_sites,
+                flat,
+                points,
+                scan_site,
+                readout,
+                readout_on_session,
+            )
         },
     )
     .map_err(|error| match error {
@@ -780,6 +941,99 @@ where
         },
     })?;
     Ok((error, point))
+}
+
+/// Evaluate the target and the approximation at `points` in one batch and
+/// return `|f - tt|` per point.
+///
+/// Shared by the coordinate scans of [`walk_from_start`] and the third-stage
+/// enumeration of [`search_with_readout`], so both use the same evaluator
+/// batching, readout branch, and checks. `scan_site` is the varied site of a
+/// coordinate scan, used as the readout's cache hint; `None` gives no hint.
+///
+/// # Errors
+///
+/// Fails when the evaluator or the readout fails or returns the wrong number
+/// of values, when the candidate index array cannot be built, or when a
+/// residual is not finite.
+// INVARIANT: the parameter list is the batch plus the search-scoped owners it
+// borrows, the same boundary as `walk_from_start`.
+#[allow(clippy::too_many_arguments)]
+fn batch_residuals<T, R>(
+    execution: &mut dyn BatchExecution<T>,
+    cache: &mut TreeTNCachedEvaluator<'_, usize>,
+    treetn: &TreeTN<IdxTensor, usize>,
+    site_indices: &[DynIndex],
+    n_sites: usize,
+    flat: &mut Vec<usize>,
+    points: &[MultiIndex],
+    scan_site: Option<usize>,
+    readout: &mut R,
+    readout_on_session: SessionReadout<T>,
+) -> Result<Vec<f64>>
+where
+    T: FullPivLuScalar + Scalar + tensor4all_core::TensorElement + ScalarParts,
+    R: FnMut(
+        &mut TreeTNCachedEvaluator<'_, usize>,
+        &TreeTN<IdxTensor, usize>,
+        &[DynIndex],
+        ColMajorArrayRef<'_, usize>,
+        Option<usize>,
+    ) -> Result<Vec<AnyScalar>>,
+{
+    flat.clear();
+    for point in points {
+        flat.extend_from_slice(point);
+    }
+    let f_values = execution.call(GlobalIndexBatch::new(flat, n_sites, points.len())?)?;
+    if f_values.len() != points.len() {
+        return Err(anyhow::anyhow!(
+            "batch evaluator returned {} values for {} global-pivot candidates",
+            f_values.len(),
+            points.len(),
+        ));
+    }
+    let shape = [n_sites, points.len()];
+    let values = ColMajorArrayRef::new(flat, &shape)
+        .map_err(|error| anyhow::anyhow!("failed to build candidate index array: {error}"))?;
+    let errors: Vec<f64> = match execution.session() {
+        Some(engine) => {
+            let mut session = tensor4all_tensorbackend::explicit::Session::new(engine);
+            let tt_values: Vec<T> =
+                readout_on_session(cache, treetn, site_indices, values, scan_site, &mut session)?;
+            if tt_values.len() != points.len() {
+                return Err(anyhow::anyhow!(
+                    "approximation readout returned {} values for {} global-pivot candidates",
+                    tt_values.len(),
+                    points.len(),
+                ));
+            }
+            f_values
+                .into_iter()
+                .zip(tt_values)
+                .map(|(f, tt)| typed_interp_error(f, tt))
+                .collect()
+        }
+        None => {
+            let tt_values = readout(cache, treetn, site_indices, values, scan_site)?;
+            if tt_values.len() != points.len() {
+                return Err(anyhow::anyhow!(
+                    "approximation readout returned {} values for {} global-pivot candidates",
+                    tt_values.len(),
+                    points.len(),
+                ));
+            }
+            f_values
+                .into_iter()
+                .zip(tt_values)
+                .map(|(f, tt)| interp_error(f, tt))
+                .collect()
+        }
+    };
+    if errors.iter().any(|error| !error.is_finite()) {
+        return Err(anyhow::anyhow!("non-finite global pivot residual"));
+    }
+    Ok(errors)
 }
 
 /// Real and imaginary parts of a scalar, used to estimate the interpolation
